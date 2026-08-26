@@ -1456,6 +1456,12 @@ def _flydsl_stage1_wrapper(
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
         v2_output_layout=v2_output_layout,
+        a2_compact=parsed.get("a2_compact", False),
+        remap=parsed.get("remap", None),
+        splitk_axis=parsed.get("splitk_axis", None),
+        streamk=parsed.get("streamk", False),
+        streamk_num_wg=parsed.get("streamk_num_wg", 0),
+        streamk_mode=parsed.get("streamk_mode", "mfocus"),
     )
 
 
@@ -1523,6 +1529,16 @@ def _flydsl_stage2_wrapper(
         model_dim_pad=model_dim_pad,
         bias=bias2,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
+        b_pool_depth=parsed.get("b_pool_depth", 0),
+        x_pool_depth=parsed.get("x_pool_depth", 0),
+        a2_compact=parsed.get("a2_compact", False),
+        k_batch=parsed.get("k_batch", 1),
+        persist_n=parsed.get("persist_n", 1),
+        remap=parsed.get("remap", None),
+        splitk_axis=parsed.get("splitk_axis", None),
+        streamk=parsed.get("streamk", False),
+        streamk_num_wg=parsed.get("streamk_num_wg", 0),
+        streamk_mode=parsed.get("streamk_mode", "mfocus"),
         expert_mask=expert_mask,
         topk_ids=topk_ids,
     )

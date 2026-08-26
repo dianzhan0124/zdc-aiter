@@ -55,6 +55,12 @@ def compile_mixed_moe_gemm1(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    a2_compact: bool = False,
+    remap: str | None = None,
+    splitk_axis: str | None = None,
+    streamk: bool = False,
+    streamk_num_wg: int = 0,
+    streamk_mode: str = "mfocus",
 ):
     """Compile an ordinary stage1 MoE kernel."""
     return compile_mixed_moe_gemm1_common(
@@ -84,6 +90,12 @@ def compile_mixed_moe_gemm1(
         xcd_swizzle=xcd_swizzle,
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
+        a2_compact=a2_compact,
+        remap=remap,
+        splitk_axis=splitk_axis,
+        streamk=streamk,
+        streamk_num_wg=streamk_num_wg,
+        streamk_mode=streamk_mode,
     )
 
 
@@ -113,6 +125,16 @@ def compile_mixed_moe_gemm2(
     cu_num_mul: int = 1,
     b_nt: int = 0,
     xcd_swizzle: int = 0,
+    b_pool_depth: int = 0,
+    x_pool_depth: int = 0,
+    a2_compact: bool = False,
+    k_batch: int = 1,
+    persist_n: int = 1,
+    remap: str | None = None,
+    splitk_axis: str | None = None,
+    streamk: bool = False,
+    streamk_num_wg: int = 0,
+    streamk_mode: str = "mfocus",
 ):
     """Compile an ordinary stage2 MoE kernel."""
     return compile_mixed_moe_gemm2_common(
@@ -139,4 +161,14 @@ def compile_mixed_moe_gemm2(
         cu_num_mul=cu_num_mul,
         b_nt=b_nt,
         xcd_swizzle=xcd_swizzle,
+        b_pool_depth=b_pool_depth,
+        x_pool_depth=x_pool_depth,
+        a2_compact=a2_compact,
+        k_batch=k_batch,
+        persist_n=persist_n,
+        remap=remap,
+        splitk_axis=splitk_axis,
+        streamk=streamk,
+        streamk_num_wg=streamk_num_wg,
+        streamk_mode=streamk_mode,
     )

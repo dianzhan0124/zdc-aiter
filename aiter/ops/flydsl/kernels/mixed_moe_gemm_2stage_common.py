@@ -21,6 +21,7 @@ A8W4 path is selected by `a_dtype='fp8', b_dtype='fp4'` plus
 `gate_mode=GateMode.INTERLEAVE` + `a_scale_one=True` in stage1.
 """
 
+import os
 from contextlib import contextmanager
 
 import flydsl.compiler as flyc
@@ -55,6 +56,7 @@ from .layout_utils import get as layout_get
 from .mfma_epilogues import c_shuffle_epilog, default_epilog
 from .mfma_preshuffle_pipeline import (
     _buffer_load_vec,
+    _global_load_vec,
     buffer_copy_gmem16_dwordx4,
     lds_store_4b_xor16,
     lds_store_8b_xor16,
@@ -124,6 +126,121 @@ def _barrier(vmcnt=63, lgkmcnt=63):
 barrier = _barrier
 
 
+# --- Bypass-L2 / non-temporal cache-policy knobs (ported from rujia ep_opt_dev) ---
+# Three independent channels let us stream past L2 for the activations (X/a2), the
+# quant scales (scale_x/scale_w), and the stage2 output atomics. Defaults are OFF
+# (all loads/atomics stay L2-cached), so with no env/knob set the compiled kernels
+# are byte-identical to before. These are per-compile knobs (x_nt/scale_nt/out_nt
+# args on the compile fns, default None -> module env default below). They are NOT
+# enumerated by the tuner (would 8x the candidate grid); flip via env for L2 study.
+#   _X_CM / _X_DMA_AUX : X activation buffer_load cache_modifier / async-DMA aux
+#   _SCALE_CM          : scale buffer_load cache_modifier (weight + activation scale)
+#   _OUT_ATOMIC_AUX    : stage2 output buffer-atomic-fadd cachepolicy aux (SLC=2)
+# NB (v4_pro deviation from rujia): v4_pro's NON-atomic output store hardcodes
+# nontemporal=True already, so there is no _OUT_STORE_CM channel here -- out_nt only
+# drives the atomic aux. Wiring it to the store would FLIP that default and regress.
+_MOE_X_NT = os.environ.get("AITER_MOE_X_NT", "0") not in ("0", "false", "False")
+_X_CM = 2 if _MOE_X_NT else 0
+_X_DMA_AUX = 2 if _MOE_X_NT else 0
+_MOE_SCALE_NT = os.environ.get("AITER_MOE_SCALE_NT", "0") not in ("0", "false", "False")
+_SCALE_CM = 2 if _MOE_SCALE_NT else 0
+_MOE_OUT_NT = os.environ.get("AITER_MOE_OUT_NT", "0") not in ("0", "false", "False")
+_OUT_ATOMIC_AUX = 2 if _MOE_OUT_NT else 0
+
+# --- Deep B/X prefetch ring pool (ported from rujia ep_opt_dev) ---
+# Stage2 keeps depth-D weight (b) / activation (x) tiles in flight via a register
+# ring pool: front-load tiles 1..D-1 in the prologue, then pop-head/push-tail each
+# loop iter so ~D loads stay outstanding (matches hand-tuned ASM's deep prefetch).
+# Opt-in: b_pool_depth/x_pool_depth compile kwargs (tuner via kernel-name tag) OR
+# the env overrides below. depth<2 => pool disabled => byte-identical to before.
+#
+# NB (v4_pro deviation from rujia): the pool is wired into STAGE2 ONLY. v4_pro's
+# stage1 uses `interleaved_half` -- an instruction-level pipeline that already
+# distributes B-loads across MFMA phases (a *deeper* prefetch than rujia's coarse
+# whole-tile ring pool), so bolting the pool on there would be redundant and would
+# fight the existing schedule. Stage1 accepts the kwargs for signature parity but
+# ignores them (asserts depth<2 unsupported to avoid silently no-op tuning names).
+_MOE_S2_BPOOL_DEPTH = int(os.environ.get("AITER_MOE_S2_BPOOL_DEPTH", "0") or "0")
+_MOE_S2_XPOOL_DEPTH = int(os.environ.get("AITER_MOE_S2_XPOOL_DEPTH", "0") or "0")
+
+# --- XCD-locality 3D grid remap (ported from rujia ep_opt_dev) ---
+# Splits one of the two output-grid axes across the physical XCDs (NUM_XCD chiplets)
+# so each XCD keeps a coherent slice L2-resident, then re-derives (bx, by) from a 3D
+# (NUM_XCD, *, *) launch grid. Two variants:
+#   remap="gy": grid=(NUM_XCD, n_tiles, ceil(expert_blocks/NUM_XCD)); the sorted-M /
+#               expert-block axis is split across XCDs -> keeps input activation X
+#               L2-resident (X depends only on M). bx = bz*NUM_XCD + xcd.
+#   remap="gx": grid=(NUM_XCD, expert_blocks, ceil(n_tiles/NUM_XCD)); the N (n_tile)
+#               axis is split across XCDs -> keeps the weight n_tile slice L2-resident.
+#               by = bz*NUM_XCD + xcd.
+#   remap="off": v4_pro's existing 2D decode (by=block_id.x, bx_persist=block_id.y).
+# NB (v4_pro deviation from rujia): rujia's canonical DEFAULT is gy; v4_pro's byte-
+# identical default is the 2D "off" path, so here remap defaults to "off" (EMPTY tag,
+# byte-identical) and gy/gx are the opt-in tags "_rgy"/"_rgx". Also v4_pro loads
+# num_valid_ids unconditionally at a safe offset with HW-clamped buffer loads, so the
+# gy overflow blocks (bx>=size_expert_ids) are already rejected by the existing
+# `bx_m < num_valid` blk_valid check -- no extra range-guard scf.IfOp is needed
+# (rujia needs one because it conditionally loads max_token_id). gx-remap still folds
+# a `by < n_tiles` guard into blk_valid (the N-axis round-up overruns by n_tile).
+# MUTEX (validated at resolution): remap != "off" is rejected with xcd_swizzle>0
+# (a different linear group_m reorder -- the two locality strategies are exclusive),
+# persist_m != 1, and persistent (persist_m<=0); those reshape the M-grid dim in ways
+# that don't compose with the (NUM_XCD, *, *) decode. Split-K (k_batch>1) composes:
+# block_id.z carries group*k_batch+kz for gy/off, and gx uses block_id.z for the
+# n-tile group so split-K keeps the z-axis kz fold.
+_MOE_NUM_XCD = int(os.environ.get("AITER_MOE_NUM_XCD", "8") or "8")
+
+
+def _streamk_anti_licm_tx(tx, iv):
+    """Defeat LICM register bloat inside the StreamK persistent loops.
+
+    Same trick as rujia's persist anti-LICM: every tid-derived LDS address is
+    loop-invariant, so LLVM hoists the whole address book above the StreamK loop
+    and pins the VGPRs live across the whole sweep (occupancy loss). We fold an
+    induction-variable-dependent opaque zero into the thread id: opaque(iv) is an
+    inline-asm identity the optimizer cannot see through, so opaque(iv) - iv is
+    provably 0 at runtime (results unchanged) yet appears loop-variant. The
+    address chain is then recomputed each iteration instead of held live.
+    Returns the perturbed tx; call once right after entering the loop body.
+    """
+    iv_i32 = arith.index_cast(T.i32, iv)
+    opaque_iv = llvm.InlineAsmOp(
+        res=ir.IntegerType.get_signless(32),
+        operands_=[iv_i32],
+        asm_string="",
+        constraints="=v,0",
+        has_side_effects=False,
+        is_align_stack=False,
+    ).result
+    return tx + arith.index_cast(T.index, arith.subi(opaque_iv, iv_i32))
+
+
+def _resolve_remap(remap):
+    """Resolve the remap knob to (remap_on, remap_gx, tag). remap defaults to the
+    byte-identical 2D "off" path (empty tag)."""
+    if remap in (None, "off"):
+        return False, False, ""
+    if remap == "gy":
+        return True, False, "_rgy"
+    if remap == "gx":
+        return True, True, "_rgx"
+    raise ValueError(f"remap must be 'gy'|'gx'|'off'|None, got {remap!r}")
+
+
+def _resolve_nt_knobs(x_nt, scale_nt, out_nt):
+    """Resolve the three per-compile bypass-L2 knobs into concrete cachepolicy ints.
+
+    Each arg is None => fall back to the env-derived module default; otherwise a
+    truthy value means non-temporal (2) and falsy means normal/L2-cached (0).
+    Returns (x_cm, x_dma_aux, scale_cm, out_atomic_aux).
+    """
+    x_cm = _X_CM if x_nt is None else (2 if x_nt else 0)
+    x_aux = _X_DMA_AUX if x_nt is None else (2 if x_nt else 0)
+    sc_cm = _SCALE_CM if scale_nt is None else (2 if scale_nt else 0)
+    o_aux = _OUT_ATOMIC_AUX if out_nt is None else (2 if out_nt else 0)
+    return x_cm, x_aux, sc_cm, o_aux
+
+
 def compile_mixed_moe_gemm1_common(
     *,
     model_dim: int,
@@ -153,14 +270,48 @@ def compile_mixed_moe_gemm1_common(
     k_wave: int = 1,
     shared_expert_id: int | None = None,
     v2_output_layout: bool = False,
+    x_nt: int | None = None,
+    scale_nt: int | None = None,
+    out_nt: int | None = None,
+    b_pool_depth: int = 0,
+    x_pool_depth: int = 0,
+    a2_compact: bool = False,
+    remap: str | None = None,
+    splitk_axis: str | None = None,
+    streamk: bool = False,
+    streamk_num_wg: int = 0,
+    streamk_mode: str = "mfocus",
 ):
-    """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
+    """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim].
+
+    a2_compact: write the stage-1 output a2 in COMPACTED expert-major (sorted,
+    no-padding) order -- row = blk_valid_start[bx] + row_local (padding rows are
+    skipped, reusing the existing row_valid store guard) -- instead of scattering
+    token-major (t*topk+s). Pairs with stage2 a2_compact. Adds a trailing
+    ``arg_blk_valid_start`` kernarg and an ``_a2c`` name tag ONLY when enabled, so
+    the default (OFF) kernel name AND ABI are byte-identical to before.
+    """
+    # b_pool_depth/x_pool_depth accepted for signature parity with stage2 but NOT
+    # honored here: stage1's interleaved_half already deep-prefetches B across MFMA
+    # phases. Reject depth>=2 rather than silently no-op (a tuning name that claims a
+    # pool but runs none would mislead the tuner).
+    if b_pool_depth >= 2 or x_pool_depth >= 2:
+        raise NotImplementedError(
+            "stage1 (compile_mixed_moe_gemm1_common) does not support b_pool_depth/"
+            "x_pool_depth; stage1's interleaved_half pipeline already deep-prefetches "
+            f"B. Got b_pool_depth={b_pool_depth}, x_pool_depth={x_pool_depth}."
+        )
     heterogeneous_b = shared_expert_id is not None
     if heterogeneous_b and shared_expert_id != experts - 1:
         raise ValueError(
             "FHMoE stage1 requires shared_expert_id == experts - 1; "
             f"got {shared_expert_id=} and {experts=}"
         )
+    # Resolve bypass-L2 knobs to locals that shadow the module defaults; the kernel
+    # closures below capture these, so each per-compile value is baked into the JIT
+    # cache key (flyc.jit hashes closure scalars). out_nt is unused in stage1 (no
+    # output atomics here) but accepted for signature parity with stage2.
+    _x_cm, _x_dma_aux, _scale_cm, _ = _resolve_nt_knobs(x_nt, scale_nt, out_nt)
     gpu_arch = get_hip_arch()
     allocator_pong = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem0")
     allocator_ping = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem1")
@@ -226,6 +377,103 @@ def compile_mixed_moe_gemm1_common(
     gate_up_interleave = gate_mode is GateMode.INTERLEAVE
     gate_only = gate_mode is GateMode.GATE_ONLY
 
+    # XCD remap resolution + mutex (see module-level _resolve_remap / _MOE_NUM_XCD).
+    # remap defaults to the byte-identical 2D "off" path; gy/gx opt-in split one grid
+    # axis across NUM_XCD. splitk_axis="y" only takes effect in the gy branch with
+    # split-K (folds k_batch into the n_tile grid dim); otherwise "z".
+    _remap_on, _remap_gx, _remap_tag = _resolve_remap(remap)
+    _splitk_axis = "z" if splitk_axis is None else str(splitk_axis)
+    if _splitk_axis not in ("z", "y"):
+        raise ValueError(f"splitk_axis must be 'z'|'y'|None, got {splitk_axis!r}")
+    if _remap_on:
+        if xcd_swizzle > 0:
+            raise NotImplementedError(
+                "remap (XCD 3D-grid) is mutually exclusive with xcd_swizzle (linear "
+                f"group_m reorder); got remap={remap!r}, xcd_swizzle={xcd_swizzle}"
+            )
+        if persist_m != 1:
+            raise NotImplementedError(
+                f"remap requires persist_m == 1 (got {persist_m}); the XCD decode "
+                "maps the persist loop's single M-block per WG"
+            )
+    _sk_axis_y = (
+        _remap_on and not _remap_gx and _splitk_axis == "y" and k_batch > 1
+    )
+
+    # StreamK (stage1): a fixed grid of `streamk_num_wg` persistent WGs sweeps the
+    # output tiles; each WG's flat unit range is precomputed on-device by
+    # streamk_schedule (even-split) into the arg_blk_valid_start kernarg slot (reused
+    # -- streamk and a2_compact can't be on together). 6 dispatch modes decode the
+    # unit/local index -> (bx=m-block, by=n-tile). MUTEX: streamk is exclusive with
+    # split-K / persist_m>1 / persistent / remap / xcd_swizzle / a2_compact.
+    _streamk_on = bool(streamk)
+    if _streamk_on:
+        if k_batch > 1:
+            raise NotImplementedError(
+                "streamk stage1 is mutually exclusive with split-K (k_batch>1); "
+                f"got k_batch={k_batch}"
+            )
+        if persist_m != 1:
+            raise NotImplementedError(
+                "streamk stage1 is mutually exclusive with persist_m!=1 / persistent; "
+                f"got persist_m={persist_m}"
+            )
+        if _remap_on:
+            raise NotImplementedError(
+                f"streamk stage1 is mutually exclusive with remap; got remap={remap!r}"
+            )
+        if xcd_swizzle > 0:
+            raise NotImplementedError(
+                "streamk stage1 is mutually exclusive with xcd_swizzle; "
+                f"got xcd_swizzle={xcd_swizzle}"
+            )
+        if a2_compact:
+            raise NotImplementedError(
+                "streamk stage1 is mutually exclusive with a2_compact (both reuse the "
+                "arg_blk_valid_start kernarg slot)"
+            )
+        if heterogeneous_b:
+            raise NotImplementedError(
+                "streamk stage1 is mutually exclusive with heterogeneous_b (the shared-"
+                "expert kernel signature has no trailing arg_blk_valid_start kernarg)"
+            )
+        if int(streamk_num_wg) <= 0:
+            raise ValueError("streamk stage1 requires streamk_num_wg > 0")
+        if int(streamk_num_wg) % int(_MOE_NUM_XCD) != 0:
+            raise ValueError(
+                f"streamk_num_wg ({streamk_num_wg}) must be a multiple of "
+                f"NUM_XCD ({_MOE_NUM_XCD})"
+            )
+        if str(streamk_mode) not in (
+            "lockstep", "lockstep_mouter", "xcd_nsplit", "mfocus", "flat", "affine",
+        ):
+            raise ValueError(
+                "streamk_mode must be lockstep|lockstep_mouter|xcd_nsplit|mfocus|"
+                f"flat|affine, got {streamk_mode!r}"
+            )
+    _streamk_tag = (
+        f"_streamk{int(streamk_num_wg)}_{streamk_mode}" if _streamk_on else ""
+    )
+    # Compile-time n_tiles for the StreamK decode -- MUST match the host launcher's
+    # gx (see _launch_mixed_moe_gemm1). streamk is mutex with remap/split-K/persist,
+    # and inter_dim/tile_n/inter_dim_pad are all compile-time here, so a constant is
+    # exact. Mirror the launcher formula byte-for-byte, including tile2_pad.
+    _gu_interleave_c1 = (gate_mode is GateMode.INTERLEAVE) or (
+        gate_mode is GateMode.MOCK_GATE_ONLY
+    )
+    _gate_only_c1 = gate_mode is GateMode.GATE_ONLY
+    _sk_tile2_pad = 0
+    if not _gate_only_c1:
+        _tk2 = int(tile_k) // 2
+        _sk_tile2_pad = (_tk2 - (int(inter_dim) - int(inter_dim_pad)) % _tk2) % _tk2
+    # The launcher's gx uses the RUNTIME n dim (i32_inter_in == host _n_in ==
+    # 2*inter_dim for mx gemm, gate+up packed), NOT inter_dim. Mirror that base.
+    _sk_inter_base = 2 * int(inter_dim) - 2 * int(inter_dim_pad) + _sk_tile2_pad
+    if _gu_interleave_c1:
+        _sk_ntiles = (_sk_inter_base + int(tile_n) - 1) // int(tile_n)
+    else:
+        _sk_ntiles = ((_sk_inter_base + 2 * int(tile_n) - 1) // int(tile_n)) // 2
+
     is_splitk = k_batch > 1
     if mock_gate_only and not is_splitk:
         raise ValueError("mock_gate_only requires k_batch > 1 (split-K)")
@@ -269,6 +517,26 @@ def compile_mixed_moe_gemm1_common(
     need_quant = need_fp4 or need_fp8
     need_sort = need_quant
 
+    if a2_compact:
+        # Compacted expert-major a2 write. Only the tuned quantized-output path
+        # (CShuffle epilogue, non-split-K, non-heterogeneous) is supported; other
+        # paths raise rather than silently scattering token-major (index errors in
+        # a2_compact fail silently downstream).
+        if is_splitk:
+            raise NotImplementedError(
+                "a2_compact stage1 does not support split-K; got "
+                f"k_batch={k_batch}."
+            )
+        if heterogeneous_b:
+            raise NotImplementedError(
+                "a2_compact stage1 does not support heterogeneous_b (FHMoE)."
+            )
+        if not need_sort:
+            raise NotImplementedError(
+                "a2_compact stage1 requires a sorted/quantized output (need_sort); "
+                f"got out_dtype={out_dtype!r}."
+            )
+
     fp4q_tag = "_fp4q" if need_fp4 else ""
     fp8q_tag = "_fp8q" if need_fp8 else ""
     sort_tag = "_sort" if need_sort else ""
@@ -285,14 +553,23 @@ def compile_mixed_moe_gemm1_common(
     # therefore must not be part of the on-disk symbol/cache identity.
     act_tag = "" if act == "silu" else f"_{act}"
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
+    # a2_compact adds a trailing arg_blk_valid_start kernarg (ABI change), so it
+    # MUST get a distinct symbol -- otherwise a cached OFF binary could be called
+    # with the extra arg. Empty when OFF -> byte-identical name.
+    a2c_tag = "_a2c" if a2_compact else ""
+    # XCD remap: empty for OFF (byte-identical), _rgy/_rgx for the two variants.
+    # splitk_axis="y" only affects the gy branch under split-K -> _ay tag then.
+    remap_tag = _remap_tag
+    sk_axis_tag = "_ay" if _sk_axis_y else ""
     # ABI v33 adds four runtime SiTUv2 beta scalars; heterogeneous ABI tracks one
     # version ahead of the ordinary kernel.
     kernel_version = 34 if heterogeneous_b else 33
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}{a2c_tag}{remap_tag}{sk_axis_tag}{_streamk_tag}_v{kernel_version}"
     ).replace("-", "_")
 
+    _stage2_lds_out_stride = int(tile_n)
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
     single_x_bytes = int(tile_m) * int(lds_stride) * int(a_elem_bytes)
     x_region_bytes = k_wave * single_x_bytes
@@ -464,6 +741,7 @@ def compile_mixed_moe_gemm1_common(
             f32_situ_linear_beta: fx.Float32,
             f32_situ_linear_beta_rcp: fx.Float32,
             f32_swiglu_limit: fx.Float32,
+            arg_blk_valid_start: fx.Pointer = None,
         ):
 
             tokens_in = arith.index_cast(ir.IndexType.get(), i32_tokens_in.ir_value())
@@ -534,8 +812,60 @@ def compile_mixed_moe_gemm1_common(
             layout_lds = fx.make_layout(shape_lds, stride_lds)
 
             tx = gpu.thread_id("x")
-            by = gpu.block_id("x")
-            bx_persist = gpu.block_id("y")
+            # XCD-remap decode (mutually exclusive with xcd_swizzle; see _resolve_remap).
+            # remap OFF keeps the original 2D mapping byte-identical. gy/gx re-derive
+            # (bx_persist, by) from a 3D (NUM_XCD, *, *) grid. _by_in_range flags the
+            # gx N-axis round-up overrun so the padding blocks fold into blk_valid.
+            _by_in_range = None
+            _remap_kz = None
+            if const_expr(_remap_on):
+                _c_nxcd = arith.constant(_MOE_NUM_XCD, index=True)
+                _xcd = gpu.block_id("x")
+                if const_expr(_remap_gx):
+                    # grid=(NUM_XCD, expert_blocks, ceil(n_tiles/NUM_XCD)): split N.
+                    bx_persist = gpu.block_id("y")
+                    if const_expr(is_splitk):
+                        _bidz = gpu.block_id("z")
+                        _remap_kz = _bidz % arith.constant(k_batch, index=True)
+                        _bzg = _bidz // arith.constant(k_batch, index=True)
+                    else:
+                        _bzg = gpu.block_id("z")
+                    by = _bzg * _c_nxcd + _xcd
+                    # n_tiles = grid_x (same formula as launcher gx / xcd_swizzle blk).
+                    one = arith.constant(1, index=True)
+                    tile_n_idx = arith.constant(tile_n, index=True)
+                    inter_pad_idx = arith.constant(2 * inter_dim_pad, index=True)
+                    if const_expr(mock_gate_only or gate_up_interleave):
+                        _n_tiles = (n_in - inter_pad_idx + tile_n_idx - one) // tile_n_idx
+                    else:
+                        two = arith.constant(2, index=True)
+                        _n_tiles = (
+                            (n_in - inter_pad_idx + two * tile_n_idx - one)
+                            // tile_n_idx
+                            // two
+                        )
+                    _by_in_range = arith.cmpi(CmpIPredicate.ult, by, _n_tiles)
+                else:
+                    # grid=(NUM_XCD, n_tiles, ceil(expert_blocks/NUM_XCD)): split M.
+                    if const_expr(_sk_axis_y):
+                        _bycomb = gpu.block_id("y")
+                        by = _bycomb // arith.constant(k_batch, index=True)
+                        _remap_kz = _bycomb % arith.constant(k_batch, index=True)
+                        _bzg = gpu.block_id("z")
+                    else:
+                        by = gpu.block_id("y")
+                        if const_expr(is_splitk):
+                            _bidz = gpu.block_id("z")
+                            _remap_kz = _bidz % arith.constant(k_batch, index=True)
+                            _bzg = _bidz // arith.constant(k_batch, index=True)
+                        else:
+                            _bzg = gpu.block_id("z")
+                    bx_persist = _bzg * _c_nxcd + _xcd
+                    # bx overrun (bx_m >= num_valid) is already rejected by the
+                    # existing blk_valid check -> no extra guard needed here.
+            else:
+                by = gpu.block_id("x")
+                bx_persist = gpu.block_id("y")
 
             if const_expr(xcd_swizzle > 0):
                 num_xcds = 8
@@ -578,8 +908,13 @@ def compile_mixed_moe_gemm1_common(
 
             k_base_idx = arith.index(0)
             if const_expr(is_splitk):
-                bz = gpu.block_id("z")
-                k_base_idx = bz * arith.constant(k_dim, index=True)
+                if const_expr(_remap_on):
+                    # remap repurposes block_id.z (see decode above): kz was already
+                    # extracted into _remap_kz.
+                    k_base_idx = _remap_kz * arith.constant(k_dim, index=True)
+                else:
+                    bz = gpu.block_id("z")
+                    k_base_idx = bz * arith.constant(k_dim, index=True)
 
             k_blocks16 = arith.constant(eff_tile_k_bytes // 16, index=True)
             layout_tx_wave_lane = fx.make_layout((num_waves_total, 64), stride=(64, 1))
@@ -712,6 +1047,143 @@ def compile_mixed_moe_gemm1_common(
                     arg_out_scale_sorted, sort_scale_nbytes
                 )
 
+            # ── StreamK dispatch (stage1) ──────────────────────────────────────
+            # A fixed grid of streamk_num_wg persistent WGs sweeps the (m-block, n-tile)
+            # output-tile space. Each of the 6 modes opens a loop nest whose induction
+            # vars decode to (bx=m-block, by=n-tile); the nest WRAPS the persist loop +
+            # entire tile body. by_n / bx_persist become loop-variant here so the closure
+            # body (moe_gemm1_body, defined below) recomputes them each unit. streamk is
+            # mutex with split-K/persist_m!=1/remap, so k_base_idx stays 0 and persist_m
+            # is 1 (the persist loop is a 1-trip pass-through). _sk_in_range flags units
+            # whose n-tile ran past n_tiles (grid rounding); folded into blk_valid below.
+            _sk_in_range = None
+            _sk_ips = []  # InsertionPoints to __exit__ in reverse (innermost last)
+            if const_expr(_streamk_on):
+                _sk_NXCD = int(_MOE_NUM_XCD)
+                _sk_STRIDE = int(streamk_num_wg) // _sk_NXCD
+                _sk_NTILES = int(_sk_ntiles)
+                _sk_mode = str(streamk_mode)
+                _c1_i = arith.constant(1, index=True)
+                _c0_i = arith.constant(0, index=True)
+                _nxcd_i32 = arith.constant(_sk_NXCD, type=T.i32)
+                _stride_i32 = arith.constant(_sk_STRIDE, type=T.i32)
+                _ntiles_i32 = arith.constant(_sk_NTILES, type=T.i32)
+                _c1_i32 = arith.constant(1, type=T.i32)
+                _tm_i32 = arith.constant(int(sort_block_m), type=T.i32)
+                _wg_i32 = arith.index_cast(T.i32, gpu.block_id("x"))
+                _xcd_i32 = arith.remui(_wg_i32, _nxcd_i32)
+                _local_i32 = arith.divui(_wg_i32, _nxcd_i32)
+                # vmb = ceil(num_valid / sort_block_m) (num_valid_i32 loaded above).
+                _vmb_i32 = arith.divui(
+                    arith.subi(arith.addi(num_valid_i32, _tm_i32), _c1_i32), _tm_i32
+                )
+
+                def _sk_open(lo, hi):
+                    _f = scf.ForOp(lo, hi, _c1_i)
+                    _ip = ir.InsertionPoint(_f.body)
+                    _ip.__enter__()
+                    _sk_ips.append(_ip)
+                    return _f.induction_variable
+
+                if _sk_mode in ("lockstep", "lockstep_mouter"):
+                    _owned = arith.constant(
+                        (_sk_NTILES + _sk_NXCD - 1) // _sk_NXCD, index=True
+                    )
+                    _nsteps_i32 = arith.divui(
+                        arith.subi(arith.addi(_vmb_i32, _stride_i32), _c1_i32),
+                        _stride_i32,
+                    )
+                    _nsteps = arith.index_cast(T.index, _nsteps_i32)
+                    if _sk_mode == "lockstep":
+                        _i_idx = _sk_open(_c0_i, _owned)     # outer: tile_n round
+                        _s_idx = _sk_open(_c0_i, _nsteps)    # inner: m-step
+                        _inner_iv = _s_idx
+                    else:
+                        _s_idx = _sk_open(_c0_i, _nsteps)    # outer: m-step
+                        _i_idx = _sk_open(_c0_i, _owned)     # inner: tile_n round
+                        _inner_iv = _i_idx
+                    _i_i32 = arith.index_cast(T.i32, _i_idx)
+                    _s_i32 = arith.index_cast(T.i32, _s_idx)
+                    _by_i32 = arith.addi(_xcd_i32, arith.muli(_i_i32, _nxcd_i32))
+                    _bx_i32 = arith.addi(arith.muli(_s_i32, _stride_i32), _local_i32)
+                    _sk_in_range = arith.cmpi(CmpIPredicate.ult, _by_i32, _ntiles_i32)
+                elif _sk_mode == "xcd_nsplit":
+                    _ninner = arith.constant(
+                        (_sk_NTILES + _sk_STRIDE - 1) // _sk_STRIDE, index=True
+                    )
+                    _mx_i32 = arith.divui(
+                        arith.subi(arith.addi(_vmb_i32, _nxcd_i32), _c1_i32), _nxcd_i32
+                    )
+                    _mbase_i32 = arith.muli(_xcd_i32, _mx_i32)
+                    _mx_idx = arith.index_cast(T.index, _mx_i32)
+                    _s_idx = _sk_open(_c0_i, _mx_idx)        # outer: m-block
+                    _i_idx = _sk_open(_c0_i, _ninner)        # inner: n-group
+                    _inner_iv = _i_idx
+                    _mm_i32 = arith.index_cast(T.i32, _s_idx)
+                    _nn_i32 = arith.index_cast(T.i32, _i_idx)
+                    _bx_i32 = arith.addi(_mbase_i32, _mm_i32)
+                    _by_i32 = arith.addi(arith.muli(_nn_i32, _stride_i32), _local_i32)
+                    _sk_in_range = arith.cmpi(CmpIPredicate.ult, _by_i32, _ntiles_i32)
+                elif _sk_mode in ("flat", "affine"):
+                    _slot_i32 = (
+                        arith.addi(arith.muli(_xcd_i32, _stride_i32), _local_i32)
+                        if _sk_mode == "affine"
+                        else _wg_i32
+                    )
+                    _bvs_nb = arith.constant((int(streamk_num_wg) + 1) * 4, type=T.i32)
+                    _bvs_rsrc = ptr_buffer_resource(arg_blk_valid_start, _bvs_nb)
+                    _u0_i32 = buffer_ops.buffer_load(
+                        _bvs_rsrc, _slot_i32, vec_width=1, dtype=T.i32
+                    )
+                    _u1_i32 = buffer_ops.buffer_load(
+                        _bvs_rsrc, arith.addi(_slot_i32, _c1_i32),
+                        vec_width=1, dtype=T.i32,
+                    )
+                    _u0_idx = arith.index_cast(T.index, _u0_i32)
+                    _u1_idx = arith.index_cast(T.index, _u1_i32)
+                    _u_idx = _sk_open(_u0_idx, _u1_idx)
+                    _inner_iv = _u_idx
+                    _u_i32 = arith.index_cast(T.i32, _u_idx)
+                    _by_i32 = arith.remui(_u_i32, _ntiles_i32)
+                    _bx_i32 = arith.divui(_u_i32, _ntiles_i32)
+                    _sk_in_range = arith.cmpi(
+                        CmpIPredicate.ult,
+                        arith.constant(0, type=T.i32), _c1_i32,
+                    )
+                else:  # mfocus
+                    _total_i32 = arith.muli(_vmb_i32, _ntiles_i32)
+                    _x0_i32 = arith.divui(arith.muli(_xcd_i32, _total_i32), _nxcd_i32)
+                    _x1_i32 = arith.divui(
+                        arith.muli(
+                            arith.addi(_xcd_i32, _c1_i32), _total_i32
+                        ),
+                        _nxcd_i32,
+                    )
+                    _span_i32 = arith.subi(_x1_i32, _x0_i32)
+                    _nrounds_i32 = arith.divui(
+                        arith.subi(arith.addi(_span_i32, _stride_i32), _c1_i32),
+                        _stride_i32,
+                    )
+                    _nrounds = arith.index_cast(T.index, _nrounds_i32)
+                    _k_idx = _sk_open(_c0_i, _nrounds)
+                    _inner_iv = _k_idx
+                    _k_i32 = arith.index_cast(T.i32, _k_idx)
+                    _u_i32 = arith.addi(
+                        _x0_i32,
+                        arith.addi(arith.muli(_k_i32, _stride_i32), _local_i32),
+                    )
+                    _by_i32 = arith.remui(_u_i32, _ntiles_i32)
+                    _bx_i32 = arith.divui(_u_i32, _ntiles_i32)
+                    _sk_in_range = arith.cmpi(CmpIPredicate.ult, _u_i32, _x1_i32)
+                # Override the block-derived (bx, by) with the per-unit decode. These
+                # feed the persist loop (persist_m==1) below and by_n / the body.
+                bx_persist = arith.index_cast(T.index, _bx_i32)
+                by = arith.index_cast(T.index, _by_i32)
+                by_n = by * arith.constant(tile_n, index=True)
+                # Anti-LICM: keep tid-derived LDS addresses loop-variant across the sweep.
+                if const_expr(os.environ.get("AITER_SK_NO_ANTILICM", "0") != "1"):
+                    tx = _streamk_anti_licm_tx(tx, _inner_iv)
+
             PERSIST_M = persist_m
             c0_p = arith.constant(0, index=True)
             c1_p = arith.constant(1, index=True)
@@ -725,6 +1197,26 @@ def compile_mixed_moe_gemm1_common(
 
             bx_m_i32 = arith.index_cast(T.i32, bx_m)
             blk_valid = arith.cmpi(CmpIPredicate.ult, bx_m_i32, num_valid_i32)
+            if const_expr(_by_in_range is not None):
+                # gx-remap: the N-axis round-up (ceil(n_tiles/NUM_XCD)*NUM_XCD) can put
+                # by past the real n_tiles; fold that guard in so overrun blocks exit
+                # via the whole-kernel gate (no OOB N-tile work).
+                blk_valid = arith.andi(blk_valid, _by_in_range)
+            if const_expr(_sk_in_range is not None):
+                # StreamK: fold the per-unit n-tile in-range guard (lockstep/nsplit
+                # round n up past n_tiles; mfocus overruns past its XCD span) into the
+                # whole-kernel gate so out-of-range units exit cleanly (no OOB work).
+                blk_valid = arith.andi(blk_valid, _sk_in_range)
+            if const_expr(a2_compact):
+                # blk_valid_start[bx]: compacted-row base for this sort block. Sized
+                # by size_expert_ids_in (one entry per sort block, == expert_ids).
+                _bvs_nbytes1 = arith.index_cast(
+                    T.i32, size_expert_ids_in * arith.constant(4, index=True)
+                )
+                _bvs_rsrc1 = ptr_buffer_resource(arg_blk_valid_start, _bvs_nbytes1)
+                _bvs1_i32 = buffer_ops.buffer_load(
+                    _bvs_rsrc1, bx, vec_width=1, dtype=T.i32
+                )
             expert_i32 = buffer_ops.buffer_load(
                 expert_rsrc, bx, vec_width=1, dtype=T.i32
             )
@@ -830,13 +1322,19 @@ def compile_mixed_moe_gemm1_common(
                     idx_elem = (
                         idx_i32 if a_elem_bytes == 1 else (idx_i32 * arith.index(2))
                     )
-                    return buffer_copy_gmem16_dwordx4(
+                    # Inlined buffer_copy_gmem16_dwordx4 so x_nt can drive the
+                    # cache_modifier (the wrapper has no such param). _x_cm=0 (default)
+                    # reproduces the wrapper byte-for-byte.
+                    return _buffer_load_vec(
                         buffer_ops,
                         vector,
+                        x_rsrc,
+                        idx_elem,
                         elem_type=x_elem,
-                        idx_i32=idx_elem,
-                        rsrc=x_rsrc,
                         vec_elems=vec16_elems,
+                        elem_bytes=1,
+                        offset_in_bytes=False,
+                        cache_modifier=_x_cm,
                     )
 
                 x_row_base_div4 = []
@@ -1172,7 +1670,7 @@ def compile_mixed_moe_gemm1_common(
                                     a_scale_bases[mi] + k_off,
                                     vec_width=1,
                                     dtype=T.i32,
-                                    cache_modifier=0,
+                                    cache_modifier=_scale_cm,
                                 )
                                 s = rearrange_a_scale(s)
                                 a_scale_tile.append(
@@ -1184,7 +1682,7 @@ def compile_mixed_moe_gemm1_common(
                                 gate_scale_bases[ni] + k_off,
                                 vec_width=1,
                                 dtype=T.i32,
-                                cache_modifier=0,
+                                cache_modifier=_scale_cm,
                             )
                             gs = rearrange_b_scale(gs)
                             gate_b_scale.append(
@@ -1198,7 +1696,7 @@ def compile_mixed_moe_gemm1_common(
                                     up_scale_bases[ni] + k_off,
                                     vec_width=1,
                                     dtype=T.i32,
-                                    cache_modifier=0,
+                                    cache_modifier=_scale_cm,
                                 )
                                 us = rearrange_b_scale(us)
                                 up_b_scale.append(
@@ -1281,7 +1779,7 @@ def compile_mixed_moe_gemm1_common(
                                 global_offset,
                                 arith.constant(0, type=T.i32),
                                 arith.constant(0, type=T.i32),
-                                arith.constant(0, type=T.i32),
+                                arith.constant(_x_dma_aux, type=T.i32),
                             )
 
                     def prefetch_x_to_lds(base_k, lds_buffer):
@@ -1707,7 +2205,7 @@ def compile_mixed_moe_gemm1_common(
                                             a_scale_bases[mi_p] + ku_off,
                                             vec_width=1,
                                             dtype=T.i32,
-                                            cache_modifier=0,
+                                            cache_modifier=_scale_cm,
                                         )
                                         new_as_list.append(rearrange_a_scale(raw_as))
                                 for gs_ni in range_constexpr(num_acc_n_packed):
@@ -1716,7 +2214,7 @@ def compile_mixed_moe_gemm1_common(
                                         gate_scale_bases[gs_ni] + ku_off,
                                         vec_width=1,
                                         dtype=T.i32,
-                                        cache_modifier=0,
+                                        cache_modifier=_scale_cm,
                                     )
                                     new_gs_list.append(rearrange_b_scale(gs_raw))
                                 if const_expr(not single_b_pipe):
@@ -1726,7 +2224,7 @@ def compile_mixed_moe_gemm1_common(
                                             up_scale_bases[us_ni] + ku_off,
                                             vec_width=1,
                                             dtype=T.i32,
-                                            cache_modifier=0,
+                                            cache_modifier=_scale_cm,
                                         )
                                         new_us_list.append(rearrange_b_scale(us_raw))
 
@@ -1875,6 +2373,7 @@ def compile_mixed_moe_gemm1_common(
                 a_scale_pong, gate_bs_pong, up_bs_pong = prefetch_ab_scale_tile(
                     k0_scale
                 )
+                # Fill lds_tid before the main loop so the load overlaps the whole K loop.
                 c_tile_m_idx = arith.constant(tile_m, index=True)
                 tid_in_range = arith.cmpi(CmpIPredicate.ult, tx, c_tile_m_idx)
                 if_tid = scf.IfOp(tid_in_range)
@@ -2453,7 +2952,14 @@ def compile_mixed_moe_gemm1_common(
                     t_idx = arith.index_cast(ir.IndexType.get(), t)
                     s_idx = arith.index_cast(ir.IndexType.get(), s)
                     ts_idx = t_idx * arith.constant(topk, index=True) + s_idx
-                    if const_expr(v2_output_layout):
+                    if const_expr(a2_compact):
+                        # Compacted expert-major row = blk_valid_start[bx] + row_local
+                        # (gapless: padding rows are dropped by the row_valid guard in
+                        # store_pair). row_local is the block-local row [0, tile_m).
+                        payload_row_idx = (
+                            arith.index_cast(ir.IndexType.get(), _bvs1_i32) + row_local
+                        )
+                    elif const_expr(v2_output_layout):
                         payload_row_idx = row
                     else:
                         payload_row_idx = ts_idx
@@ -3067,6 +3573,14 @@ def compile_mixed_moe_gemm1_common(
             scf.YieldOp([])
             for_ip.__exit__(None, None, None)
 
+            # Close the StreamK loop nest (innermost first). Each level needs a
+            # barrier (LDS reuse between units) + YieldOp before __exit__.
+            if const_expr(_streamk_on):
+                for _sk_ip in reversed(_sk_ips):
+                    gpu.barrier()
+                    scf.YieldOp([])
+                    _sk_ip.__exit__(None, None, None)
+
     if heterogeneous_b:
 
         @flyc.kernel(name=module_name, known_block_size=[total_threads, 1, 1])
@@ -3119,7 +3633,7 @@ def compile_mixed_moe_gemm1_common(
                 f32_swiglu_limit,
             )
 
-    else:
+    elif not (a2_compact or _streamk_on):
 
         @flyc.kernel(name=module_name, known_block_size=[total_threads, 1, 1])
         def moe_gemm1(
@@ -3167,6 +3681,61 @@ def compile_mixed_moe_gemm1_common(
                 f32_situ_linear_beta,
                 f32_situ_linear_beta_rcp,
                 f32_swiglu_limit,
+            )
+
+    else:
+        # a2_compact OR streamk (non-het): trailing arg_blk_valid_start kernarg.
+        # a2_compact reads compacted-row bases; streamk flat/affine read wg_unit
+        # boundaries (other streamk modes ignore it but keep the ABI uniform).
+        # Distinct module_name (_a2c / _streamk tag) so this ABI never aliases OFF.
+        @flyc.kernel(name=module_name, known_block_size=[total_threads, 1, 1])
+        def moe_gemm1(
+            arg_out: fx.Pointer,
+            arg_x: fx.Pointer,
+            arg_w: fx.Pointer,
+            arg_scale_x: fx.Pointer,
+            arg_scale_w: fx.Pointer,
+            arg_sorted_token_ids: fx.Pointer,
+            arg_expert_ids: fx.Pointer,
+            arg_sorted_weights: fx.Pointer,
+            arg_num_valid_ids: fx.Pointer,
+            arg_bias: fx.Pointer,
+            arg_out_scale_sorted: fx.Pointer,
+            i32_tokens_in: fx.Int32,
+            i32_n_in: fx.Int32,
+            i32_k_in: fx.Int32,
+            i32_size_expert_ids_in: fx.Int32,
+            f32_situ_beta: fx.Float32,
+            f32_situ_beta_rcp: fx.Float32,
+            f32_situ_linear_beta: fx.Float32,
+            f32_situ_linear_beta_rcp: fx.Float32,
+            f32_swiglu_limit: fx.Float32,
+            arg_blk_valid_start: fx.Pointer,
+        ):
+            _emit_moe_gemm1(
+                arg_out,
+                arg_x,
+                arg_w,
+                arg_scale_x,
+                arg_scale_w,
+                arg_w,
+                arg_scale_w,
+                arg_sorted_token_ids,
+                arg_expert_ids,
+                arg_sorted_weights,
+                arg_num_valid_ids,
+                arg_bias,
+                arg_out_scale_sorted,
+                i32_tokens_in,
+                i32_n_in,
+                i32_k_in,
+                i32_size_expert_ids_in,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linear_beta,
+                f32_situ_linear_beta_rcp,
+                f32_swiglu_limit,
+                arg_blk_valid_start,
             )
 
     cache_tag = (
@@ -3219,6 +3788,7 @@ def compile_mixed_moe_gemm1_common(
         f32_situ_linear_beta_rcp: fx.Float32,
         f32_swiglu_limit: fx.Float32,
         stream: fx.Stream,
+        arg_blk_valid_start: fx.Pointer = None,
     ):
         _ = cache_tag
         allocator_pong.finalized = False
@@ -3281,6 +3851,30 @@ def compile_mixed_moe_gemm1_common(
                 f32_situ_linear_beta_rcp,
                 f32_swiglu_limit,
             )
+        elif const_expr(a2_compact or _streamk_on):
+            launcher = moe_gemm1(
+                arg_out,
+                arg_x,
+                arg_w,
+                arg_scale_x,
+                arg_scale_w,
+                arg_sorted_token_ids,
+                arg_expert_ids,
+                arg_sorted_weights,
+                arg_max_token_ids,
+                arg_bias,
+                arg_out_scale_sorted,
+                i32_tokens_in,
+                i32_inter_in,
+                i32_k_in,
+                i32_size_expert_ids_in,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linear_beta,
+                f32_situ_linear_beta_rcp,
+                f32_swiglu_limit,
+                arg_blk_valid_start,
+            )
         else:
             launcher = moe_gemm1(
                 arg_out,
@@ -3309,9 +3903,38 @@ def compile_mixed_moe_gemm1_common(
             for op in ctx.gpu_module_body.operations:
                 if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
                     op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(T.i32, wpe)
-        launcher.launch(
-            grid=(gx, gy, k_batch), block=(total_threads, 1, 1), stream=stream
-        )
+        if const_expr(_streamk_on):
+            # StreamK: fixed 1D persistent grid of streamk_num_wg WGs (each sweeps a
+            # load-balanced slice of the (m-block, n-tile) space in-kernel).
+            launcher.launch(
+                grid=(arith.constant(int(streamk_num_wg), index=True),
+                      arith.constant(1, index=True),
+                      arith.constant(1, index=True)),
+                block=(total_threads, 1, 1), stream=stream,
+            )
+        elif const_expr(_remap_on):
+            # 3D (NUM_XCD, *, *) grid; persist_m==1 under remap so gy == expert_blocks.
+            # gx == n_tiles. See module-level remap note + the kernel decode above.
+            _c_nxcd_l = arith.constant(_MOE_NUM_XCD, index=True)
+            _nxm1 = arith.constant(_MOE_NUM_XCD - 1, index=True)
+            if const_expr(_remap_gx):
+                _gz = (gx + _nxm1) // _c_nxcd_l
+                if const_expr(is_splitk):
+                    _gz = _gz * arith.constant(k_batch, index=True)
+                _grid = (_c_nxcd_l, gy, _gz)
+            else:
+                _gz = (gy + _nxm1) // _c_nxcd_l
+                if const_expr(_sk_axis_y):
+                    _grid = (_c_nxcd_l, gx * arith.constant(k_batch, index=True), _gz)
+                else:
+                    if const_expr(is_splitk):
+                        _gz = _gz * arith.constant(k_batch, index=True)
+                    _grid = (_c_nxcd_l, gx, _gz)
+            launcher.launch(grid=_grid, block=(total_threads, 1, 1), stream=stream)
+        else:
+            launcher.launch(
+                grid=(gx, gy, k_batch), block=(total_threads, 1, 1), stream=stream
+            )
 
     if heterogeneous_b:
 
@@ -3367,7 +3990,7 @@ def compile_mixed_moe_gemm1_common(
                 stream,
             )
 
-    else:
+    elif not (a2_compact or _streamk_on):
 
         @flyc.jit
         def launch_mixed_moe_gemm1(
@@ -3419,6 +4042,62 @@ def compile_mixed_moe_gemm1_common(
                 stream,
             )
 
+    else:
+        # a2_compact OR streamk (non-het): host passes arg_blk_valid_start before
+        # stream. streamk flat/affine read the wg_unit schedule from it; the other
+        # modes ignore it but keep the ABI uniform (mutex with a2_compact).
+        @flyc.jit
+        def launch_mixed_moe_gemm1(
+            arg_out: fx.Pointer,
+            arg_x: fx.Pointer,
+            arg_w: fx.Pointer,
+            arg_scale_x: fx.Pointer,
+            arg_scale_w: fx.Pointer,
+            arg_sorted_token_ids: fx.Pointer,
+            arg_expert_ids: fx.Pointer,
+            arg_sorted_weights: fx.Pointer,
+            arg_max_token_ids: fx.Pointer,
+            arg_bias: fx.Pointer,
+            arg_out_scale_sorted: fx.Pointer,
+            i32_tokens_in: fx.Int32,
+            i32_inter_in: fx.Int32,
+            i32_k_in: fx.Int32,
+            i32_size_expert_ids_in: fx.Int32,
+            f32_situ_beta: fx.Float32,
+            f32_situ_beta_rcp: fx.Float32,
+            f32_situ_linear_beta: fx.Float32,
+            f32_situ_linear_beta_rcp: fx.Float32,
+            f32_swiglu_limit: fx.Float32,
+            arg_blk_valid_start: fx.Pointer,
+            stream: fx.Stream,
+        ):
+            _launch_mixed_moe_gemm1(
+                arg_out,
+                arg_x,
+                arg_w,
+                arg_scale_x,
+                arg_scale_w,
+                arg_w,
+                arg_scale_w,
+                arg_sorted_token_ids,
+                arg_expert_ids,
+                arg_sorted_weights,
+                arg_max_token_ids,
+                arg_bias,
+                arg_out_scale_sorted,
+                i32_tokens_in,
+                i32_inter_in,
+                i32_k_in,
+                i32_size_expert_ids_in,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linear_beta,
+                f32_situ_linear_beta_rcp,
+                f32_swiglu_limit,
+                stream,
+                arg_blk_valid_start,
+            )
+
     return launch_mixed_moe_gemm1
 
 
@@ -3448,20 +4127,258 @@ def compile_mixed_moe_gemm2_common(
     b_nt: int = 0,
     xcd_swizzle: int = 0,
     shared_expert_id: int | None = None,
+    x_nt: int | None = None,
+    scale_nt: int | None = None,
+    out_nt: int | None = None,
+    b_pool_depth: int = 0,
+    x_pool_depth: int = 0,
+    a2_compact: bool = False,
+    k_batch: int = 1,
+    persist_n: int = 1,
+    remap: str | None = None,
+    splitk_axis: str | None = None,
+    streamk: bool = False,
+    streamk_num_wg: int = 0,
+    streamk_mode: str = "mfocus",
 ):
-    """Compile stage2 kernel (moe_gemm2): A2 @ W2.T -> [tokens, model_dim], atomic-add."""
+    """Compile stage2 kernel (moe_gemm2): A2 @ W2.T -> [tokens, model_dim], atomic-add.
+
+    a2_compact: read the stage-1 output a2 in COMPACTED expert-major (sorted,
+    no-padding) order -- the M-block's a2 DATA rows are contiguous starting at
+    blk_valid_start[bx] (passed as a trailing arg_blk_valid_start kernarg) instead
+    of gathering token-major via sorted_token_ids (row = t*topk+s). Pairs with
+    stage1 a2_compact. NOTE the a2 SCALE stays block-major (v4_pro already indexes
+    a-scale by bx_m, L4742), so a2_compact touches ONLY the a2 data read -- a real
+    simplification vs rujia (which also compacts the scale). The kernarg + _a2c2
+    name tag flip together, so the def/name/ABI are byte-identical when OFF."""
     heterogeneous_b = shared_expert_id is not None
     if heterogeneous_b and shared_expert_id != experts - 1:
         raise ValueError(
             "FHMoE stage2 requires shared_expert_id == experts - 1; "
             f"got {shared_expert_id=} and {experts=}"
         )
-    del b_nt
+    # Bypass-L2 knobs -> locals captured by the kernel closures (baked into JIT
+    # cache key). out_nt drives the output atomic-fadd aux; the non-atomic store
+    # path keeps its hardcoded nontemporal=True (see _resolve_nt_knobs note).
+    _x_cm, _x_dma_aux, _scale_cm, _out_atomic_aux = _resolve_nt_knobs(
+        x_nt, scale_nt, out_nt
+    )
+    # Deep B/X prefetch ring pool depths (per-compile kwarg > env default). The
+    # actual _use_pool/_use_xpool gates are computed at the loop site below (they
+    # also require depth>=2, not async-copy, and NOT b_split_enabled).
+    _bp_depth = b_pool_depth if b_pool_depth else _MOE_S2_BPOOL_DEPTH
+    _xp_depth = x_pool_depth if x_pool_depth else _MOE_S2_XPOOL_DEPTH
     _sort_block_m = tile_m if sort_block_m <= 0 else sort_block_m
     if const_expr(_sort_block_m != tile_m and _sort_block_m % tile_m != 0):
         raise ValueError(
             f"sort_block_m ({_sort_block_m}) must be a multiple of tile_m ({tile_m})"
         )
+    if a2_compact:
+        # Compacted a2 assumes routed-only, gapless expert-major rows. The shared
+        # expert (FHMoE) has no compacted layout (stage1 rejects het too), so the
+        # blk_valid_start prefix would mis-address its activation rows -> silent
+        # garbage. Reject rather than fail silently.
+        if heterogeneous_b:
+            raise NotImplementedError(
+                "a2_compact stage2 does not support heterogeneous_b (FHMoE); "
+                f"got shared_expert_id={shared_expert_id}."
+            )
+
+    # -- Split-K (partition the GEMM K=inter_dim across `k_batch` workgroups) --
+    # Stage2 is a plain linear down-projection that already atomic-accumulates its
+    # result into the final output. Split-K therefore only needs to slice the
+    # K-loop per CTA (block_id.z encodes the K-partition) and let the existing
+    # atomics sum the partials, so it requires accumulate=True. Unlike rujia's
+    # fp8/int8 stage2, v4_pro's MXFP4 block-scale column is addressed by the
+    # ABSOLUTE K position, so the runtime k_start = bz*k_per_batch must be threaded
+    # into both the tile loads AND the scale reads -- mirroring v4_pro's OWN stage1
+    # `k_base_idx` idiom. k_batch==1 keeps the original path byte-identical.
+    is_splitk = int(k_batch) > 1
+    if is_splitk:
+        if not bool(accumulate):
+            raise NotImplementedError(
+                "split-K (k_batch>1) stage2 requires accumulate=True (atomic sum "
+                f"of K-partials); got accumulate={accumulate}."
+            )
+        if int(persist_m) <= 0:
+            raise NotImplementedError(
+                "split-K (k_batch>1) stage2 is mutually exclusive with the "
+                f"persistent grid (persist_m<=0); got persist_m={persist_m}."
+            )
+        if int(persist_m) > 1:
+            raise NotImplementedError(
+                "split-K (k_batch>1) stage2 is mutually exclusive with persist_m>1; "
+                f"got persist_m={persist_m}."
+            )
+        if enable_bias:
+            # bias is added inside the epilogue of EVERY K-partial; under atomic
+            # accumulation that adds bias k_batch times. rujia's stage2 has no bias;
+            # v4_pro stage1 guards the same way (`enable_bias and not is_splitk`).
+            raise NotImplementedError(
+                "split-K (k_batch>1) stage2 does not support enable_bias (bias would "
+                "be atomic-added k_batch times)."
+            )
+        if a2_compact:
+            raise NotImplementedError(
+                "a2_compact stage2 does not support split-K; got "
+                f"k_batch={k_batch}."
+            )
+        if int(inter_dim) % int(k_batch) != 0:
+            raise ValueError(
+                f"split-K: inter_dim={inter_dim} not divisible by k_batch={k_batch}"
+            )
+        _k_per_batch = int(inter_dim) // int(k_batch)
+        if _k_per_batch % int(tile_k) != 0:
+            raise ValueError(
+                f"split-K: K_per_batch={_k_per_batch} not divisible by tile_k={tile_k}"
+            )
+        if (_k_per_batch // int(tile_k)) < 2:
+            raise ValueError(
+                "split-K: K_per_batch must be >= 2*tile_k (pipeline needs >=2 tail "
+                f"tiles); got K_per_batch={_k_per_batch}, tile_k={tile_k}."
+            )
+        # MXFP4 block-scale column is addressed by absolute-K // (scale_pack_k*128)
+        # = //256, plus a k_shift derived from (K//128)%scale_pack_k. k_start must
+        # align to that 256-elem scale granularity so the compile-time k_shift stays
+        # valid and the runtime scale-base add (k_start//256) is exact.
+        if _k_per_batch % 256 != 0:
+            raise ValueError(
+                f"split-K: K_per_batch={_k_per_batch} must be a multiple of 256 "
+                "(MXFP4 scale granularity) so k_start aligns to a scale block."
+            )
+    else:
+        _k_per_batch = int(inter_dim)
+
+    # ── persist_n: N-merge factor (analogous to persist_m along M) ───────────
+    # persist_n = how many consecutive N-tiles (model_dim output tiles) each WG
+    # serially sweeps. The N tiles of a given M-block share the SAME stage2
+    # activation X (X depends only on M/inter_dim, not on the output dim), so
+    # folding several N-tiles into one WG keeps X L2-resident across them and
+    # shrinks the launch N-grid dim by persist_n.
+    #   persist_n <= 1 (default) -> each WG covers 1 N-tile (grid N = _gx_total,
+    #                               IR/name/ABI byte-identical to before).
+    #   persist_n = k > 1        -> grid N = _gx_total/k; each WG loops over k
+    #                               consecutive N-tiles (base = by*k + j).
+    # Only honored for the plain path (k_batch==1, persist_m==1) and when N stays
+    # on a single grid axis (xcd_swizzle==0 already remaps grid_x per XCD). A
+    # requested value that does not divide _gx_total or an unsupported combo
+    # silently falls back to 1 -> byte-identical OFF, no new kernarg.
+    _gx_total = int(model_dim) // int(tile_n)
+    _pn_req = int(persist_n)
+    _persist_n_ok = (
+        _pn_req > 1
+        and _pn_req <= _gx_total
+        and (_gx_total % _pn_req == 0)
+        and int(k_batch) == 1
+        and int(persist_m) == 1
+        and int(xcd_swizzle) == 0
+        # model_dim_pad!=0 makes the runtime gx = (n_in-pad+..)//tile_n differ from
+        # the compile-time _gx_total, so the exact /_persist_n divide would drop
+        # tiles. Only honor persist_n on the unpadded output.
+        and int(model_dim_pad) == 0
+    )
+    _persist_n = _pn_req if _persist_n_ok else 1
+
+    # ── XCD remap (stage2) ───────────────────────────────────────────────────
+    # Same 3D (NUM_XCD, *, *) grid as stage1. gy splits the sorted-M/expert-block
+    # axis across XCDs (keeps a2 activation L2-resident); gx splits the N axis
+    # (model_dim output tiles; keeps the weight n_tile slice L2-resident). remap
+    # defaults to the byte-identical 2D "off" path. MUTEX: reject with xcd_swizzle,
+    # persist_m!=1, persistent (persist_m<=0), and persist_n>1 (both remap the N/M
+    # grid dims). Split-K composes via block_id.z (or the y-fold for gy+axis=y).
+    _remap_on, _remap_gx, _remap_tag = _resolve_remap(remap)
+    _splitk_axis = "z" if splitk_axis is None else str(splitk_axis)
+    if _splitk_axis not in ("z", "y"):
+        raise ValueError(f"splitk_axis must be 'z'|'y'|None, got {splitk_axis!r}")
+    if _remap_on:
+        if int(xcd_swizzle) > 0:
+            raise NotImplementedError(
+                "remap (XCD 3D-grid) is mutually exclusive with xcd_swizzle; got "
+                f"remap={remap!r}, xcd_swizzle={xcd_swizzle}"
+            )
+        if int(persist_m) != 1:
+            raise NotImplementedError(
+                f"remap stage2 requires persist_m == 1 (got {persist_m})"
+            )
+        if _persist_n > 1:
+            raise NotImplementedError(
+                f"remap stage2 is mutually exclusive with persist_n>1 (both remap "
+                f"the N grid dim); got persist_n={persist_n}"
+            )
+    _sk_axis_y = (
+        _remap_on and not _remap_gx and _splitk_axis == "y" and int(k_batch) > 1
+    )
+
+    # ── StreamK (stage2) ─────────────────────────────────────────────────────
+    # A fixed grid of `streamk_num_wg` persistent WGs sweeps the (m-block, n-tile)
+    # output-tile space; each WG's flat unit range is precomputed on-device by
+    # streamk_schedule (even-split) into the arg_blk_valid_start kernarg slot
+    # (reused -- streamk ⊥ a2_compact). 6 dispatch modes decode the unit/local
+    # index -> (bx=m-block, by=n-tile). MUTEX: streamk is exclusive with split-K /
+    # persist_m!=1 / persistent / persist_n>1 / remap / xcd_swizzle / a2_compact /
+    # heterogeneous_b. Mirrors the stage1 StreamK port; the ONLY divergence is the
+    # N dim = model_dim (down-GEMM output) NOT 2*inter_dim, so _sk_ntiles uses the
+    # runtime gx base = model_dim (n_in), matching the stage2 launcher gx.
+    _streamk_on = bool(streamk)
+    if _streamk_on:
+        if int(k_batch) > 1:
+            raise NotImplementedError(
+                "streamk stage2 is mutually exclusive with split-K (k_batch>1); "
+                f"got k_batch={k_batch}"
+            )
+        if int(persist_m) != 1:
+            raise NotImplementedError(
+                "streamk stage2 is mutually exclusive with persist_m!=1 / persistent; "
+                f"got persist_m={persist_m}"
+            )
+        if _persist_n > 1:
+            raise NotImplementedError(
+                "streamk stage2 is mutually exclusive with persist_n>1; "
+                f"got persist_n={persist_n}"
+            )
+        if _remap_on:
+            raise NotImplementedError(
+                f"streamk stage2 is mutually exclusive with remap; got remap={remap!r}"
+            )
+        if int(xcd_swizzle) > 0:
+            raise NotImplementedError(
+                "streamk stage2 is mutually exclusive with xcd_swizzle; "
+                f"got xcd_swizzle={xcd_swizzle}"
+            )
+        if a2_compact:
+            raise NotImplementedError(
+                "streamk stage2 is mutually exclusive with a2_compact (both reuse the "
+                "arg_blk_valid_start kernarg slot)"
+            )
+        if heterogeneous_b:
+            raise NotImplementedError(
+                "streamk stage2 is mutually exclusive with heterogeneous_b (the shared-"
+                "expert kernel signature has no trailing arg_blk_valid_start kernarg)"
+            )
+        if int(streamk_num_wg) <= 0:
+            raise ValueError("streamk stage2 requires streamk_num_wg > 0")
+        if int(streamk_num_wg) % int(_MOE_NUM_XCD) != 0:
+            raise ValueError(
+                f"streamk_num_wg ({streamk_num_wg}) must be a multiple of "
+                f"NUM_XCD ({_MOE_NUM_XCD})"
+            )
+        if str(streamk_mode) not in (
+            "lockstep", "lockstep_mouter", "xcd_nsplit", "mfocus", "flat", "affine",
+        ):
+            raise ValueError(
+                "streamk_mode must be lockstep|lockstep_mouter|xcd_nsplit|mfocus|"
+                f"flat|affine, got {streamk_mode!r}"
+            )
+    _streamk_tag = (
+        f"_streamk{int(streamk_num_wg)}_{streamk_mode}" if _streamk_on else ""
+    )
+    # Compile-time n_tiles for the StreamK decode -- MUST match the stage2 launcher
+    # gx = ceil((n_in - model_dim_pad) / tile_n), where n_in == model_dim (the
+    # down-GEMM output dim). streamk is mutex with remap/split-K/persist_n, and
+    # model_dim/tile_n/model_dim_pad are all compile-time, so a constant is exact.
+    _sk_ntiles = (
+        int(model_dim) - int(model_dim_pad) + int(tile_n) - 1
+    ) // int(tile_n)
 
     r139_xdma_first = bool(
         use_async_copy
@@ -3560,6 +4477,13 @@ def compile_mixed_moe_gemm2_common(
     w_elem_bytes = 1
     w_elem_pack = 2 if is_f4_b else 1
     w_nbytes = (experts * model_dim * inter_dim * w_elem_bytes) // w_elem_pack
+    # The raw-pointer (GEP) weight path only earns its keep when the offsets can
+    # actually overflow: buffer_load keeps hardware bounds checking and a cheaper
+    # address encoding, so stay on it whenever w fits. Threshold is 2 GB, not 4:
+    # intermediate signed index math breaks before the unsigned voffset does.
+    # The tag keeps the two variants from colliding in the JIT cache.
+    _use_wptr64 = w_nbytes >= (1 << 31)
+    _wptr64_tag = "_wptr64" if _use_wptr64 else ""
     shared_w_nbytes = model_dim * inter_dim
     # #3476: host e8m0_shuffle pads scale group-N up to a multiple of 8, i.e.
     # 128- but not 256-aligned (e.g. 384) read OOB scales -> garbage e8m0 -> NaN.
@@ -3621,7 +4545,9 @@ def compile_mixed_moe_gemm2_common(
     wpe_tag = f"_w{waves_per_eu}" if waves_per_eu is not None else ""
     if const_expr(waves_per_eu is not None and not (1 <= int(waves_per_eu) <= 10)):
         raise ValueError(f"waves_per_eu must be in [1, 10] or None, got {waves_per_eu}")
-    num_k_tiles_per_batch = int(inter_dim) // int(tile_k)
+    # Under split-K each CTA sweeps only its K-slice (_k_per_batch == inter_dim when
+    # OFF, so this is byte-identical for k_batch==1).
+    num_k_tiles_per_batch = int(_k_per_batch) // int(tile_k)
     async_tag = "_async" if use_async_copy else ""
     cumul_tag = f"_cumul{int(cu_num_mul)}" if int(cu_num_mul) != 1 else ""
     acc_tag = "" if accumulate else "_acc0"
@@ -3638,12 +4564,30 @@ def compile_mixed_moe_gemm2_common(
             f"_vscale_fix3_fp4opt_v1{pm_tag}{sbm_tag}{wpe_tag}{async_tag}"
             f"{cumul_tag}{xcd_tag}{acc_tag}"
         )
+    # a2_compact adds a trailing arg_blk_valid_start kernarg (ABI change) and a
+    # compacted a2-data read, so it must not collide with the non-compact variant
+    # in the JIT cache. Tag + kernarg flip together -> byte-identical when OFF.
+    a2c_tag = "_a2c2" if a2_compact else ""
+    # split-K adds a z-axis grid + runtime k_start offset (no extra kernarg), so it
+    # must not collide with the k_batch==1 variant in the JIT cache. Empty when OFF
+    # -> byte-identical name.
+    sk_tag = f"_sk{k_batch}" if is_splitk else ""
+    # persist_n folds _persist_n consecutive N-tiles into each WG and divides the
+    # launch N-grid by that factor (no extra kernarg). Empty when OFF (_persist_n
+    # falls back to 1 on any unsupported combo) -> byte-identical name/ABI.
+    pn_tag = f"_pn{_persist_n}" if _persist_n > 1 else ""
+    # XCD remap: empty for OFF (byte-identical), _rgy/_rgx opt-in. splitk_axis="y"
+    # (gy branch, split-K only) adds _ay. sk⊥pn⊥remap so tags never collide.
+    remap_tag = _remap_tag
+    sk_axis_tag = "_ay" if _sk_axis_y else ""
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{variant_tags}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{variant_tags}{a2c_tag}{sk_tag}{pn_tag}{remap_tag}{sk_axis_tag}{_streamk_tag}{_wptr64_tag}"
     ).replace("-", "_")
+    _stage2_lds_out_stride = int(tile_n)
+    _lds_out_rows = int(tile_m)
     lds_x_bytes = 2 * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
-    lds_out_bytes = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
+    lds_out_bytes = 2 * _lds_out_rows * _stage2_lds_out_stride if _use_cshuffle_epilog else 0
     lds_tid_bytes = int(tile_m) * 4
     lds_tw_bytes = (int(tile_m) * 4) if bool(doweight_stage2) else 0
     lds_total_bytes = max(lds_x_bytes, lds_out_bytes) + lds_tid_bytes + lds_tw_bytes
@@ -3675,6 +4619,7 @@ def compile_mixed_moe_gemm2_common(
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
+            arg_blk_valid_start: fx.Pointer = None,
         ):
 
             tokens_in = arith.index_cast(ir.IndexType.get(), i32_tokens_in.ir_value())
@@ -3735,8 +4680,49 @@ def compile_mixed_moe_gemm2_common(
             layout_lds = fx.make_layout(shape_lds, stride_lds)
 
             tx = gpu.thread_id("x")
-            by_outer = gpu.block_id("x")
-            bx_persist = gpu.block_id("y")
+            # XCD-remap decode (mutually exclusive with xcd_swizzle; see stage2
+            # resolution above). remap OFF keeps the 2D mapping byte-identical. gy/gx
+            # re-derive (bx_persist, by_outer) from a 3D (NUM_XCD, *, *) grid. For gx
+            # the N-axis round-up overrun is folded into blk_valid via _by_in_range.
+            _by_in_range = None
+            _remap_kz = None
+            if const_expr(_remap_on):
+                _c_nxcd = arith.constant(_MOE_NUM_XCD, index=True)
+                _xcd = gpu.block_id("x")
+                if const_expr(_remap_gx):
+                    # grid=(NUM_XCD, expert_blocks, ceil(n_tiles/NUM_XCD)): split N.
+                    bx_persist = gpu.block_id("y")
+                    if const_expr(is_splitk):
+                        _bidz = gpu.block_id("z")
+                        _remap_kz = _bidz % arith.constant(k_batch, index=True)
+                        _bzg = _bidz // arith.constant(k_batch, index=True)
+                    else:
+                        _bzg = gpu.block_id("z")
+                    by_outer = _bzg * _c_nxcd + _xcd
+                    one = arith.constant(1, index=True)
+                    tile_n_idx = arith.constant(tile_n, index=True)
+                    model_pad_idx = arith.constant(model_dim_pad, index=True)
+                    _n_tiles = (n_in - model_pad_idx + tile_n_idx - one) // tile_n_idx
+                    _by_in_range = arith.cmpi(CmpIPredicate.ult, by_outer, _n_tiles)
+                else:
+                    # grid=(NUM_XCD, n_tiles, ceil(expert_blocks/NUM_XCD)): split M.
+                    if const_expr(_sk_axis_y):
+                        _bycomb = gpu.block_id("y")
+                        by_outer = _bycomb // arith.constant(k_batch, index=True)
+                        _remap_kz = _bycomb % arith.constant(k_batch, index=True)
+                        _bzg = gpu.block_id("z")
+                    else:
+                        by_outer = gpu.block_id("y")
+                        if const_expr(is_splitk):
+                            _bidz = gpu.block_id("z")
+                            _remap_kz = _bidz % arith.constant(k_batch, index=True)
+                            _bzg = _bidz // arith.constant(k_batch, index=True)
+                        else:
+                            _bzg = gpu.block_id("z")
+                    bx_persist = _bzg * _c_nxcd + _xcd
+            else:
+                by_outer = gpu.block_id("x")
+                bx_persist = gpu.block_id("y")
 
             if const_expr(xcd_swizzle > 0):
                 num_xcds = 8
@@ -3772,6 +4758,24 @@ def compile_mixed_moe_gemm2_common(
 
             by = by_outer
 
+            # split-K: block_id.z selects this CTA's K-partition. k_start is the
+            # absolute-K base of the slice (0 when OFF -> IR identical). Threaded
+            # into the tile loads and the scale-base below.
+            k_start = arith.index(0)
+            _sk_scale_off = None
+            if const_expr(is_splitk):
+                if const_expr(_remap_on):
+                    # remap repurposes block_id.z (kz already extracted above).
+                    bz = _remap_kz
+                else:
+                    bz = gpu.block_id("z")
+                k_start = bz * arith.constant(_k_per_batch, index=True)
+                # scale k-block index = absolute_k // 256 (scale_pack_k*128). k_start
+                # is 256-aligned, so the runtime scale-base add is exact and the
+                # compile-time k_shift stays valid (k_start//128 is a multiple of
+                # scale_pack_k -> (K//128)%scale_pack_k unchanged).
+                _sk_scale_off = k_start // arith.constant(256, index=True)
+
             k_blocks16 = arith.constant(eff_tile_k_bytes // 16, index=True)
             layout_tx_wave_lane = fx.make_layout((4, 64), stride=(64, 1))
             layout_lane16 = fx.make_layout((4, 16), stride=(16, 1))
@@ -3789,14 +4793,14 @@ def compile_mixed_moe_gemm2_common(
                     base_ptr,
                     lds_x_ptr.byte_offset,
                     (T.bf16 if out_is_bf16 else T.f16),
-                    shape=(tile_m * tile_n,),
+                    shape=(_lds_out_rows * _stage2_lds_out_stride,),
                 ).get()
                 if _use_cshuffle_epilog
                 else None
             )
 
             lds_x_b = 2 * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
-            lds_out_b = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
+            lds_out_b = 2 * _lds_out_rows * _stage2_lds_out_stride if _use_cshuffle_epilog else 0
             lds_tid_off = max(lds_x_b, lds_out_b)
             lds_tid = SmemPtr(
                 base_ptr, lds_x_ptr.byte_offset + lds_tid_off, T.i32, shape=(tile_m,)
@@ -3824,7 +4828,8 @@ def compile_mixed_moe_gemm2_common(
             x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
             x_rsrc = ptr_buffer_resource(arg_x, x_nbytes_i32)
 
-            w_rsrc = ptr_buffer_resource(arg_w, w_nbytes)
+            # Bound to one resource only when it fits; see _use_wptr64.
+            w_rsrc = None if _use_wptr64 else ptr_buffer_resource(arg_w, w_nbytes)
             shared_w_rsrc = ptr_buffer_resource(arg_shared_w, shared_w_nbytes)
 
             out_elem_bytes = 1 if need_fp8_out else (4 if out_is_f32 else 2)
@@ -3920,6 +4925,145 @@ def compile_mixed_moe_gemm2_common(
             c0_p = arith.constant(0, index=True)
             c1_p = arith.constant(1, index=True)
 
+            # ── StreamK dispatch (stage2) ──────────────────────────────────────
+            # A fixed grid of streamk_num_wg persistent WGs sweeps the (m-block,
+            # n-tile) output space. Each of the 6 modes opens a loop nest whose
+            # induction vars decode to (bx=m-block, by=n-tile); the nest WRAPS the
+            # persist loop + entire tile body. by / bx_persist become loop-variant
+            # so the closure body (moe_gemm2_then_body) recomputes body_by_n each
+            # unit. streamk ⊥ split-K/persist_m!=1/remap, so k_start stays 0 and
+            # persist_m is 1 (persist loop is a 1-trip pass-through). m-block
+            # granularity is tile_m (stage2 bx_m = bx*tile_m), n_tiles uses the
+            # model_dim base (down-GEMM output). _sk_in_range flags units whose
+            # n-tile ran past n_tiles (grid rounding); folded into blk_valid below.
+            _sk_in_range = None
+            _sk_ips = []  # InsertionPoints to __exit__ in reverse (innermost last)
+            if const_expr(_streamk_on):
+                _sk_NXCD = int(_MOE_NUM_XCD)
+                _sk_STRIDE = int(streamk_num_wg) // _sk_NXCD
+                _sk_NTILES = int(_sk_ntiles)
+                _sk_mode = str(streamk_mode)
+                _c1_i = arith.constant(1, index=True)
+                _c0_i = arith.constant(0, index=True)
+                _nxcd_i32 = arith.constant(_sk_NXCD, type=T.i32)
+                _stride_i32 = arith.constant(_sk_STRIDE, type=T.i32)
+                _ntiles_i32 = arith.constant(_sk_NTILES, type=T.i32)
+                _c1_i32 = arith.constant(1, type=T.i32)
+                _tm_i32 = arith.constant(int(tile_m), type=T.i32)
+                _wg_i32 = arith.index_cast(T.i32, gpu.block_id("x"))
+                _xcd_i32 = arith.remui(_wg_i32, _nxcd_i32)
+                _local_i32 = arith.divui(_wg_i32, _nxcd_i32)
+                # vmb = ceil(num_valid / tile_m) (num_valid_i32 loaded above).
+                _vmb_i32 = arith.divui(
+                    arith.subi(arith.addi(num_valid_i32, _tm_i32), _c1_i32), _tm_i32
+                )
+
+                def _sk_open(lo, hi):
+                    _f = scf.ForOp(lo, hi, _c1_i)
+                    _ip = ir.InsertionPoint(_f.body)
+                    _ip.__enter__()
+                    _sk_ips.append(_ip)
+                    return _f.induction_variable
+
+                if _sk_mode in ("lockstep", "lockstep_mouter"):
+                    _owned = arith.constant(
+                        (_sk_NTILES + _sk_NXCD - 1) // _sk_NXCD, index=True
+                    )
+                    _nsteps_i32 = arith.divui(
+                        arith.subi(arith.addi(_vmb_i32, _stride_i32), _c1_i32),
+                        _stride_i32,
+                    )
+                    _nsteps = arith.index_cast(T.index, _nsteps_i32)
+                    if _sk_mode == "lockstep":
+                        _i_idx = _sk_open(_c0_i, _owned)     # outer: tile_n round
+                        _s_idx = _sk_open(_c0_i, _nsteps)    # inner: m-step
+                        _inner_iv = _s_idx
+                    else:
+                        _s_idx = _sk_open(_c0_i, _nsteps)    # outer: m-step
+                        _i_idx = _sk_open(_c0_i, _owned)     # inner: tile_n round
+                        _inner_iv = _i_idx
+                    _i_i32 = arith.index_cast(T.i32, _i_idx)
+                    _s_i32 = arith.index_cast(T.i32, _s_idx)
+                    _by_i32 = arith.addi(_xcd_i32, arith.muli(_i_i32, _nxcd_i32))
+                    _bx_i32 = arith.addi(arith.muli(_s_i32, _stride_i32), _local_i32)
+                    _sk_in_range = arith.cmpi(CmpIPredicate.ult, _by_i32, _ntiles_i32)
+                elif _sk_mode == "xcd_nsplit":
+                    _ninner = arith.constant(
+                        (_sk_NTILES + _sk_STRIDE - 1) // _sk_STRIDE, index=True
+                    )
+                    _mx_i32 = arith.divui(
+                        arith.subi(arith.addi(_vmb_i32, _nxcd_i32), _c1_i32), _nxcd_i32
+                    )
+                    _mbase_i32 = arith.muli(_xcd_i32, _mx_i32)
+                    _mx_idx = arith.index_cast(T.index, _mx_i32)
+                    _s_idx = _sk_open(_c0_i, _mx_idx)        # outer: m-block
+                    _i_idx = _sk_open(_c0_i, _ninner)        # inner: n-group
+                    _inner_iv = _i_idx
+                    _mm_i32 = arith.index_cast(T.i32, _s_idx)
+                    _nn_i32 = arith.index_cast(T.i32, _i_idx)
+                    _bx_i32 = arith.addi(_mbase_i32, _mm_i32)
+                    _by_i32 = arith.addi(arith.muli(_nn_i32, _stride_i32), _local_i32)
+                    _sk_in_range = arith.cmpi(CmpIPredicate.ult, _by_i32, _ntiles_i32)
+                elif _sk_mode in ("flat", "affine"):
+                    _slot_i32 = (
+                        arith.addi(arith.muli(_xcd_i32, _stride_i32), _local_i32)
+                        if _sk_mode == "affine"
+                        else _wg_i32
+                    )
+                    _bvs_nb = arith.constant((int(streamk_num_wg) + 1) * 4, type=T.i32)
+                    _bvs_rsrc = ptr_buffer_resource(arg_blk_valid_start, _bvs_nb)
+                    _u0_i32 = buffer_ops.buffer_load(
+                        _bvs_rsrc, _slot_i32, vec_width=1, dtype=T.i32
+                    )
+                    _u1_i32 = buffer_ops.buffer_load(
+                        _bvs_rsrc, arith.addi(_slot_i32, _c1_i32),
+                        vec_width=1, dtype=T.i32,
+                    )
+                    _u0_idx = arith.index_cast(T.index, _u0_i32)
+                    _u1_idx = arith.index_cast(T.index, _u1_i32)
+                    _u_idx = _sk_open(_u0_idx, _u1_idx)
+                    _inner_iv = _u_idx
+                    _u_i32 = arith.index_cast(T.i32, _u_idx)
+                    _by_i32 = arith.remui(_u_i32, _ntiles_i32)
+                    _bx_i32 = arith.divui(_u_i32, _ntiles_i32)
+                    _sk_in_range = arith.cmpi(
+                        CmpIPredicate.ult,
+                        arith.constant(0, type=T.i32), _c1_i32,
+                    )
+                else:  # mfocus
+                    _total_i32 = arith.muli(_vmb_i32, _ntiles_i32)
+                    _x0_i32 = arith.divui(arith.muli(_xcd_i32, _total_i32), _nxcd_i32)
+                    _x1_i32 = arith.divui(
+                        arith.muli(
+                            arith.addi(_xcd_i32, _c1_i32), _total_i32
+                        ),
+                        _nxcd_i32,
+                    )
+                    _span_i32 = arith.subi(_x1_i32, _x0_i32)
+                    _nrounds_i32 = arith.divui(
+                        arith.subi(arith.addi(_span_i32, _stride_i32), _c1_i32),
+                        _stride_i32,
+                    )
+                    _nrounds = arith.index_cast(T.index, _nrounds_i32)
+                    _k_idx = _sk_open(_c0_i, _nrounds)
+                    _inner_iv = _k_idx
+                    _k_i32 = arith.index_cast(T.i32, _k_idx)
+                    _u_i32 = arith.addi(
+                        _x0_i32,
+                        arith.addi(arith.muli(_k_i32, _stride_i32), _local_i32),
+                    )
+                    _by_i32 = arith.remui(_u_i32, _ntiles_i32)
+                    _bx_i32 = arith.divui(_u_i32, _ntiles_i32)
+                    _sk_in_range = arith.cmpi(CmpIPredicate.ult, _u_i32, _x1_i32)
+                # Override the block-derived (bx_persist, by) with the per-unit
+                # decode. These feed the persist loop (persist_m==1) below and the
+                # body's body_by_n via the `by` closure.
+                bx_persist = arith.index_cast(T.index, _bx_i32)
+                by = arith.index_cast(T.index, _by_i32)
+                # Anti-LICM: keep tid-derived LDS addresses loop-variant across sweep.
+                if const_expr(os.environ.get("AITER_SK_NO_ANTILICM", "0") != "1"):
+                    tx = _streamk_anti_licm_tx(tx, _inner_iv)
+
             if const_expr(persistent):
                 c_cu = arith.constant(cu_num, index=True)
                 c_tm_p = arith.constant(tile_m, index=True)
@@ -3964,6 +5108,29 @@ def compile_mixed_moe_gemm2_common(
 
             bx_m_i32 = arith.index_cast(T.i32, bx_m)
             blk_valid = arith.cmpi(CmpIPredicate.ult, bx_m_i32, num_valid_i32)
+            if const_expr(_by_in_range is not None):
+                # gx-remap: fold the N-axis round-up guard so overrun N-tiles exit
+                # via the whole-kernel gate (no OOB output atomics).
+                blk_valid = arith.andi(blk_valid, _by_in_range)
+            if const_expr(_sk_in_range is not None):
+                # StreamK: fold the per-unit n-tile in-range guard (lockstep/nsplit
+                # round n up past n_tiles; mfocus overruns past its XCD span) into
+                # the whole-kernel gate so out-of-range units exit (no OOB atomics).
+                blk_valid = arith.andi(blk_valid, _sk_in_range)
+
+            # a2_compact: the compacted a2 DATA rows for this fine M-tile are
+            # contiguous starting at blk_valid_start[bx]. Valid rows form a prefix
+            # within each tile_m block (stage1 wrote them gaplessly), so the
+            # compacted row is simply bvs[bx] + row_local. Loaded once per bx.
+            if const_expr(a2_compact):
+                _bvs_nbytes2 = arith.index_cast(
+                    T.i32, size_expert_ids_in * arith.constant(4, index=True)
+                )
+                _bvs_rsrc2 = ptr_buffer_resource(arg_blk_valid_start, _bvs_nbytes2)
+                _bvs2_i32 = buffer_ops.buffer_load(
+                    _bvs_rsrc2, bx, vec_width=1, dtype=T.i32
+                )
+                _bvs2_idx = arith.index_cast(ir.IndexType.get(), _bvs2_i32)
 
             sort_blk = _div_pow2(bx_m, _sort_block_m)
             expert_i32 = buffer_ops.buffer_load(
@@ -3988,6 +5155,21 @@ def compile_mixed_moe_gemm2_common(
                 delta_b = delta_expert_idx * arith.constant(expert_b_stride, index=True)
                 expert_b_base = prev_expert_b_base + delta_b
 
+            # Raw global pointer for the routed weight loads: load_cell folds
+            # expert_b_base into the buffer voffset, which the hardware truncates
+            # to 32 bits, so every expert whose byte offset passes 2**32 silently
+            # reads another expert's weights. E=896 with model_dim=3584 and
+            # inter_dim=3072 -- one rank holding every expert -- gives w2 = 4.6 GB,
+            # so experts past 780 wrap back to the start. A GEP forms the address
+            # in full 64-bit instead.
+            w_base_ptr = (
+                buffer_ops.create_llvm_ptr(
+                    arith.index_cast(T.i64, fx.ptrtoint(arg_w)), address_space=1
+                )
+                if _use_wptr64
+                else None
+            )
+
             first_tok = buffer_ops.buffer_load(
                 sorted_rsrc, bx_m, vec_width=1, dtype=T.i32
             )
@@ -4006,7 +5188,12 @@ def compile_mixed_moe_gemm2_common(
             def moe_gemm2_then_body(
                 shared_b: bool = False,
                 shared_n_half: int | None = None,
+                by_tile=None,
             ):
+                # by_tile: the N-tile index this invocation computes. Defaults to the
+                # per-WG `by` (single N-tile). Under persist_n>1 the outer N-loop passes
+                # by*_persist_n + j so one WG sweeps _persist_n consecutive N-tiles.
+                _by = by if by_tile is None else by_tile
                 body_b_has_full_operand = is_f8_b or shared_b
                 body_tile_n = tile_n // 2 if shared_n_half is not None else tile_n
                 body_n_offset = (
@@ -4102,13 +5289,18 @@ def compile_mixed_moe_gemm2_common(
                         idx_elem = (
                             idx_i32 if a_elem_bytes == 1 else (idx_i32 * arith.index(2))
                         )
-                        return buffer_copy_gmem16_dwordx4(
+                        # Inlined buffer_copy_gmem16_dwordx4 so x_nt can drive the
+                        # cache_modifier; _x_cm=0 (default) matches the wrapper.
+                        return _buffer_load_vec(
                             buffer_ops,
                             vector,
+                            x_rsrc,
+                            idx_elem,
                             elem_type=x_elem,
-                            idx_i32=idx_elem,
-                            rsrc=x_rsrc,
                             vec_elems=vec16_elems,
+                            elem_bytes=1,
+                            offset_in_bytes=False,
+                            cache_modifier=_x_cm,
                         )
                     idx_bytes = idx_i32 * arith.index(4)
                     return _buffer_load_vec(
@@ -4120,6 +5312,7 @@ def compile_mixed_moe_gemm2_common(
                         vec_elems=x_load_vec_elems,
                         elem_bytes=a_elem_bytes,
                         offset_in_bytes=True,
+                        cache_modifier=_x_cm,
                     )
 
                 if const_expr(use_async_copy and a_elem_vec_pack > 1):
@@ -4140,7 +5333,12 @@ def compile_mixed_moe_gemm2_common(
                     x_row_local.append(row_local)
                     x_col_local_i32.append(col_local_i32)
 
-                    if const_expr(i < num_x_addr_loads):
+                    if const_expr(a2_compact and i < num_x_addr_loads):
+                        # Compacted expert-major a2: dense rows starting at
+                        # bvs[bx]. No sorted_token_ids gather for the a2 DATA.
+                        crow_idx = _bvs2_idx + row_local
+                        x_row_base_div4.append(crow_idx * c_k_div4)
+                    elif const_expr(i < num_x_addr_loads):
                         sorted_row_i = bx_m + row_local
                         fused_i = buffer_ops.buffer_load(
                             sorted_rsrc, sorted_row_i, vec_width=1, dtype=T.i32
@@ -4197,7 +5395,7 @@ def compile_mixed_moe_gemm2_common(
                 wave_mod_4 = _mod_pow2(wave_id, 4)
                 n_tile_base = wave_mod_4 * c_n_per_wave
 
-                body_by_n = by * arith.constant(tile_n, index=True) + arith.constant(
+                body_by_n = _by * arith.constant(tile_n, index=True) + arith.constant(
                     body_n_offset, index=True
                 )
 
@@ -4245,7 +5443,9 @@ def compile_mixed_moe_gemm2_common(
                     k1 = lane_div_16
                     vec_elems = kpack_bytes // int(b_elem_bytes)
 
-                    def load_cell(rsrc, expert_base, stride_n0, elem_type, k0):
+                    def load_cell(
+                        rsrc, expert_base, stride_n0, elem_type, k0, via_ptr=False
+                    ):
                         idx_pack = (
                             expert_base
                             + blk[ni] * arith.constant(stride_n0, index=True)
@@ -4253,7 +5453,12 @@ def compile_mixed_moe_gemm2_common(
                             + k1 * arith.constant(b_stride_klane, index=True)
                             + intra[ni] * arith.constant(b_stride_nlane, index=True)
                         )
-                        b16 = _buffer_load_vec(
+                        # via_ptr: routed weights go through a raw pointer so the
+                        # offset is not capped by the 32-bit buffer voffset (w2 is
+                        # 4.6 GB under TP1). The shared expert stays on a buffer --
+                        # it is one expert wide, so it keeps its bounds check.
+                        _load = _global_load_vec if via_ptr else _buffer_load_vec
+                        b16 = _load(
                             buffer_ops,
                             vector,
                             rsrc,
@@ -4262,6 +5467,7 @@ def compile_mixed_moe_gemm2_common(
                             vec_elems=vec_elems,
                             elem_bytes=b_elem_bytes,
                             offset_in_bytes=(b_elem_bytes == 1),
+                            cache_modifier=b_nt,
                         )
                         b_i64x2 = vector.bitcast(vec2_i64, b16)
                         return (
@@ -4293,19 +5499,21 @@ def compile_mixed_moe_gemm2_common(
                         return s0, s1, s2, s3
 
                     b0, b1 = load_cell(
-                        w_rsrc,
+                        w_base_ptr if _use_wptr64 else w_rsrc,
                         expert_b_base,
                         b_stride_n0,
                         w_elem_type(),
                         routed_k0_base,
+                        via_ptr=_use_wptr64,
                     )
                     if const_expr(is_f8_b):
                         b2, b3 = load_cell(
-                            w_rsrc,
+                            w_base_ptr if _use_wptr64 else w_rsrc,
                             expert_b_base,
                             b_stride_n0,
                             w_elem_type(),
                             routed_k0_base + arith.index(1),
+                            via_ptr=_use_wptr64,
                         )
                         return b0, b1, b2, b3
                     return b0, b1
@@ -4370,7 +5578,13 @@ def compile_mixed_moe_gemm2_common(
                         + k_lane * scale_info.stride_klane
                         + n_lane
                     )
-                    s = buffer_ops.buffer_load(rsrc, idx_pack, vec_width=1, dtype=T.i32)
+                    s = buffer_ops.buffer_load(
+                        rsrc,
+                        idx_pack,
+                        vec_width=1,
+                        dtype=T.i32,
+                        cache_modifier=_scale_cm,
+                    )
                     return vector.from_elements(T.vec(1, T.i32), [s])
 
                 def apply_k_shift(scale_vec, k_shift_bits):
@@ -4537,7 +5751,7 @@ def compile_mixed_moe_gemm2_common(
                                 global_offset,
                                 arith.constant(0, type=T.i32),
                                 arith.constant(0, type=T.i32),
-                                arith.constant(0, type=T.i32),
+                                arith.constant(_x_dma_aux, type=T.i32),
                             )
 
                     def prefetch_x_to_lds(base_k, lds_base):
@@ -4607,7 +5821,7 @@ def compile_mixed_moe_gemm2_common(
                                 bias_offset = expert_off_idx + global_n
                                 bias.append(load_bias_scalar(bias_rsrc, bias_offset))
                         tw_pf = None
-                        if const_expr(doweight_stage2):
+                        if const_expr(doweight_stage2) and tw_pf is None:
                             tw_pf = []
                             lane_div_16_mul4_pf = lane_div_16 * arith.index(4)
                             vec4_f32_pf = T.vec(4, f32)
@@ -4843,6 +6057,15 @@ def compile_mixed_moe_gemm2_common(
                 def k_base(k_py):
                     return k_py // scale_pack_k // 128
 
+                def _scale_kb(k_py):
+                    # Scale k-block base for a RELATIVE tile position k_py. Under
+                    # split-K the absolute scale block = k_base(k_py) + k_start//256;
+                    # returns a plain compile-time int when OFF (byte-identical).
+                    _kb = k_base(k_py)
+                    if const_expr(is_splitk):
+                        return arith.constant(_kb, index=True) + _sk_scale_off
+                    return _kb
+
                 row_stride_bytes_pre = int(model_dim) * int(out_elem_bytes)
                 use_buf_atomic_pre = bool(accumulate) and (
                     row_stride_bytes_pre <= 16384
@@ -4909,8 +6132,10 @@ def compile_mixed_moe_gemm2_common(
                 if const_expr(not r216_defer_tid):
                     emit_tid_lds_prologue()
 
-                k0 = arith.index(0)
-                k0_bk = k0
+                # split-K: prologue starts at this CTA's K-slice base (k_start; 0
+                # otherwise -> IR identical). k0_bk is the b_byte_div-scaled index.
+                k0 = k_start
+                k0_bk = k0 // arith.constant(b_byte_div, index=True)
                 if const_expr(r139_xdma_first):
                     prefetch_x_to_lds(k0, lds_base_cur)
                     rocdl.sched_barrier(0)
@@ -4919,7 +6144,7 @@ def compile_mixed_moe_gemm2_common(
                 else:
                     b_cur = load_b_tile(k0_bk)
                 a_scale_pong, b_scale_pong = prefetch_ab_scale_tile(
-                    k_base(0), k_shift_bits(0)
+                    _scale_kb(0), k_shift_bits(0)
                 )
                 rocdl.sched_barrier(0)
                 if const_expr(not r139_xdma_first):
@@ -4944,11 +6169,11 @@ def compile_mixed_moe_gemm2_common(
                     row_a_lds, col_offset_base, lds_base_pong
                 )
                 a1_col_base = col_offset_base + 128 // a_elem_vec_pack
-                a1_prefetch_pong = (
-                    lds_load_packs_k64(row_a_lds, a1_col_base, lds_base_pong)
-                    if pack_K >= 2
-                    else None
-                )
+                a1_prefetch_pong = None
+                if pack_K >= 2:
+                    a1_prefetch_pong = lds_load_packs_k64(
+                        row_a_lds, a1_col_base, lds_base_pong
+                    )
 
                 num_k_tiles_py = num_k_tiles_per_batch
                 odd_k_tiles = (num_k_tiles_py % 2) == 1
@@ -4970,6 +6195,54 @@ def compile_mixed_moe_gemm2_common(
                 b_pong = b_cur
                 k0_pong_bk = k0_bk
 
+                # --- Deep B/X prefetch ring pool (rujia port, stage2 only) ---
+                # X pool: front-load activation tiles 1..depth into regs; LDS ping-pong
+                #   ds_write stays 1-ahead (tile 0 already stored in prologue). Always
+                #   applicable (X load is a plain whole-tile register load).
+                # B pool: front-load weight tiles 1..depth-1 (tile 0 reuses `b_cur`);
+                #   ONLY when NOT b_split_enabled -- with b_split, b_cur is a lo-half
+                #   and the hi-half is deferred into compute_tile via b_hi_loader, so a
+                #   whole-tile pool cannot represent it. b_split IS v4_pro's own deep-B
+                #   prefetch, so gating the pool off there loses nothing.
+                # Both gates also require depth>=2 and not async-copy; when off the
+                # loads below are byte-identical to the pre-port path.
+                _use_xpool = (_xp_depth >= 2) and not use_async_copy
+                _use_bpool = (
+                    (_bp_depth >= 2) and not use_async_copy and not b_split_enabled
+                )
+
+                def _k_of_pool(t):
+                    # Absolute-K of pool tile t. Under split-K it is offset by this
+                    # CTA's slice base (k_start; 0 otherwise -> arith.index(t*tile_k)).
+                    if const_expr(is_splitk):
+                        return k_start + arith.constant(t * tile_k, index=True)
+                    return arith.index(t * tile_k)
+
+                def _bk_of_pool(t):
+                    # load_b_tile expects a pre-divided index (raw_k // b_byte_div),
+                    # matching the non-pool call sites (next_k1_bk = next_k1 //
+                    # b_byte_div). X uses the raw k, so keep the two helpers distinct.
+                    return _k_of_pool(t) // b_byte_div
+
+                _xpool = []
+                if const_expr(_use_xpool):
+                    _xpool = [
+                        load_x_tile(_k_of_pool(t))
+                        for t in range(1, min(_xp_depth + 1, num_k_tiles_py))
+                    ]
+                    if len(_xpool) > 0:
+                        rocdl.sched_vmem(len(_xpool) * num_x_loads)
+                _bpool = []
+                if const_expr(_use_bpool):
+                    _pooln = min(_bp_depth, num_k_tiles_py)
+                    _bpool = [b_cur] + [
+                        load_b_tile(_bk_of_pool(t)) for t in range(1, _pooln)
+                    ]
+                    if _pooln > 1:
+                        rocdl.sched_vmem(
+                            (_pooln - 1) * k_unroll * body_num_acc_n * 2
+                        )
+
                 # would create a region whose internal SSA values cannot be used
                 def make_b_hi_loader(base_k):
                     """Create a b_hi_loader callable for a given base_k."""
@@ -4977,26 +6250,52 @@ def compile_mixed_moe_gemm2_common(
 
                 if const_expr(k_main2_py > 0):
                     for k_iv_py in range_constexpr(0, k_main2_py, tile_k * 2):
-                        k_iv = arith.index(k_iv_py)
+                        # split-K: k_iv is the ABSOLUTE K of this pair (k_start-based);
+                        # k_start==0 when OFF -> arith.index(k_iv_py), IR identical.
+                        # next_k1/next_k2 (X/B loads) inherit the absolute base; scales
+                        # use _scale_kb which adds the runtime scale-block offset.
+                        if const_expr(is_splitk):
+                            k_iv = k_start + arith.constant(k_iv_py, index=True)
+                        else:
+                            k_iv = arith.index(k_iv_py)
+                        # 0-based pair index (compile-time) for pool tile arithmetic:
+                        # this pair computes tiles 2*pair_i and 2*pair_i+1.
+                        pair_i = k_iv_py // (tile_k * 2)
                         next_k1 = k_iv + tile_k
                         next_k1_py = k_iv_py + tile_k
                         next_k1_bk = next_k1 // b_byte_div
                         if const_expr(use_async_copy):
                             prefetch_x_to_lds(next_k1, lds_base_ping)
+                        elif const_expr(_use_xpool):
+                            x_regs_ping = _xpool.pop(0)  # tile 2i+1
+                            _xtl0 = (2 * pair_i + 1) + _xp_depth
+                            if _xtl0 < num_k_tiles_py:
+                                _xpool.append(load_x_tile(_k_of_pool(_xtl0)))
                         else:
                             x_regs_ping = load_x_tile(next_k1)
                         a_scale_ping, b_scale_ping = prefetch_ab_scale_tile(
-                            k_base(next_k1_py), k_shift_bits(next_k1_py)
+                            _scale_kb(next_k1_py), k_shift_bits(next_k1_py)
                         )
-                        b_ping_lo = (
-                            load_b_tile_lo(next_k1_bk)
-                            if b_split_enabled
-                            else load_b_tile(next_k1_bk)
-                        )
+                        if const_expr(_use_bpool):
+                            # pool head = tile 2i (this half's compute operand); push
+                            # tail tile 2i+depth. b_ping_lo carries tile 2i+1 for the
+                            # next half, kept in the pool.
+                            _b0 = _bpool.pop(0)
+                            _tl0 = 2 * pair_i + _bp_depth
+                            if _tl0 < num_k_tiles_py:
+                                _bpool.append(load_b_tile(_bk_of_pool(_tl0)))
+                            b_ping_lo = None
+                        else:
+                            b_ping_lo = (
+                                load_b_tile_lo(next_k1_bk)
+                                if b_split_enabled
+                                else load_b_tile(next_k1_bk)
+                            )
+                            _b0 = b_pong
 
                         acc, _ = compute_tile(
                             acc,
-                            b_pong,
+                            _b0,
                             lds_base_pong,
                             a_scale_pong,
                             b_scale_pong,
@@ -5026,20 +6325,33 @@ def compile_mixed_moe_gemm2_common(
                         next_k2_bk = next_k2 // b_byte_div
                         if const_expr(use_async_copy):
                             prefetch_x_to_lds(next_k2, lds_base_pong)
+                        elif const_expr(_use_xpool):
+                            x_regs_pong = _xpool.pop(0)  # tile 2i+2
+                            _xtl1 = (2 * pair_i + 2) + _xp_depth
+                            if _xtl1 < num_k_tiles_py:
+                                _xpool.append(load_x_tile(_k_of_pool(_xtl1)))
                         else:
                             x_regs_pong = load_x_tile(next_k2)
                         a_scale_pong, b_scale_pong = prefetch_ab_scale_tile(
-                            k_base(next_k2_py), k_shift_bits(next_k2_py)
+                            _scale_kb(next_k2_py), k_shift_bits(next_k2_py)
                         )
-                        b_pong = (
-                            load_b_tile_lo(next_k2_bk)
-                            if b_split_enabled
-                            else load_b_tile(next_k2_bk)
-                        )
+                        if const_expr(_use_bpool):
+                            _b1 = _bpool.pop(0)  # tile 2i+1
+                            _tl1 = 2 * pair_i + 1 + _bp_depth
+                            if _tl1 < num_k_tiles_py:
+                                _bpool.append(load_b_tile(_bk_of_pool(_tl1)))
+                            b_pong = None
+                        else:
+                            b_pong = (
+                                load_b_tile_lo(next_k2_bk)
+                                if b_split_enabled
+                                else load_b_tile(next_k2_bk)
+                            )
+                            _b1 = b_ping_lo
 
                         acc, _ = compute_tile(
                             acc,
-                            b_ping_lo,
+                            _b1,
                             lds_base_ping,
                             a_scale_ping,
                             b_scale_ping,
@@ -5066,9 +6378,12 @@ def compile_mixed_moe_gemm2_common(
                         )
 
                 if const_expr(odd_k_tiles):
+                    # Tail: single remaining tile (tile N-1). With bpool it is the last
+                    # entry still held in the pool; else it lives in b_pong.
+                    _bt = _bpool.pop(0) if const_expr(_use_bpool) else b_pong
                     acc, epilogue_pf = compute_tile(
                         acc,
-                        b_pong,
+                        _bt,
                         lds_base_pong,
                         a_scale_pong,
                         b_scale_pong,
@@ -5082,27 +6397,45 @@ def compile_mixed_moe_gemm2_common(
                     )
 
                 else:
-                    k_tail1 = (k_in + tile_k - 1) // tile_k * tile_k - tile_k
+                    # RELATIVE last-tile offset within this CTA's K-slice. Under
+                    # split-K the slice is _k_per_batch (== inter_dim when OFF, so the
+                    # OFF value equals the pre-port (k_in-based) result since
+                    # inter_dim%tile_k==0). k_tail1 is the ABSOLUTE X/B load index
+                    # (k_start-based); scales use _scale_kb on the relative offset.
                     k_tail1_py = (
-                        int(inter_dim) + tile_k - 1
+                        int(_k_per_batch) + tile_k - 1
                     ) // tile_k * tile_k - tile_k
+                    if const_expr(is_splitk):
+                        k_tail1 = k_start + arith.constant(k_tail1_py, index=True)
+                    else:
+                        k_tail1 = (k_in + tile_k - 1) // tile_k * tile_k - tile_k
                     k_tail1_bk = k_tail1 // b_byte_div
                     if const_expr(use_async_copy):
                         prefetch_x_to_lds(k_tail1, lds_base_ping)
+                    elif const_expr(_use_xpool):
+                        x_regs_ping = _xpool.pop(0)  # last tile's X (held in pool)
                     else:
                         x_regs_ping = load_x_tile(k_tail1)
-                    b_ping_lo = (
-                        load_b_tile_lo(k_tail1_bk)
-                        if b_split_enabled
-                        else load_b_tile(k_tail1_bk)
-                    )
+                    # Tail 2 tiles: N-2 (this compute) and N-1 (b_ping_lo below). With
+                    # bpool both are the last two entries in the pool; else b_pong holds
+                    # N-2 and we load N-1 here.
+                    if const_expr(_use_bpool):
+                        _bt0 = _bpool.pop(0)  # tile N-2
+                        b_ping_lo = _bpool.pop(0)  # tile N-1
+                    else:
+                        _bt0 = b_pong
+                        b_ping_lo = (
+                            load_b_tile_lo(k_tail1_bk)
+                            if b_split_enabled
+                            else load_b_tile(k_tail1_bk)
+                        )
                     a_scale_ping, b_scale_ping = prefetch_ab_scale_tile(
-                        k_base(k_tail1_py), k_shift_bits(k_tail1_py)
+                        _scale_kb(k_tail1_py), k_shift_bits(k_tail1_py)
                     )
 
                     acc, _ = compute_tile(
                         acc,
-                        b_pong,
+                        _bt0,
                         lds_base_pong,
                         a_scale_pong,
                         b_scale_pong,
@@ -5149,6 +6482,8 @@ def compile_mixed_moe_gemm2_common(
                 topk_i32_v = topk_i32
 
                 zero_i32 = arith.constant(0)
+                # out_nt: stream the output atomic-fadd past L2 (SLC=2) when set.
+                _out_aux_i32 = arith.constant(_out_atomic_aux)
 
                 def atomic_add_f16x2(val_f16x2, byte_off_i32):
                     rocdl.raw_ptr_buffer_atomic_fadd(
@@ -5156,7 +6491,7 @@ def compile_mixed_moe_gemm2_common(
                         out_rsrc,
                         byte_off_i32,
                         zero_i32,
-                        zero_i32,
+                        _out_aux_i32,
                     )
 
                 if const_expr(lds_out is None):
@@ -5354,7 +6689,7 @@ def compile_mixed_moe_gemm2_common(
                             out_rsrc,
                             byte_off_i32,
                             zero_i32,
-                            zero_i32,
+                            _out_aux_i32,
                         )
                     else:
                         col_idx = col_g0
@@ -5374,6 +6709,7 @@ def compile_mixed_moe_gemm2_common(
                         )
 
                 e_vec = 2 if accumulate else min(body_tile_n // 32, 8)
+                s2_nlane = 32
                 rocdl.s_setprio(3)
                 c_shuffle_epilog(
                     arith=arith,
@@ -5384,6 +6720,7 @@ def compile_mixed_moe_gemm2_common(
                     tile_m=tile_m,
                     tile_n=body_tile_n,
                     e_vec=e_vec,
+                    cshuffle_nlane=s2_nlane,
                     m_repeat=m_repeat,
                     num_acc_n=body_num_acc_n,
                     tx=tx,
@@ -5404,23 +6741,45 @@ def compile_mixed_moe_gemm2_common(
 
             all_valid = arith.andi(blk_valid, arith.andi(exp_valid, tile_has_tokens))
 
-            def emit_moe_gemm2_body():
+            def _emit_one_n_tile(by_tile=None):
                 if const_expr(heterogeneous_b):
                     format_if = scf.IfOp(is_shared_expert, has_else=True)
                     with ir.InsertionPoint(format_if.then_block):
                         if const_expr(serial_shared_n):
-                            moe_gemm2_then_body(shared_b=True, shared_n_half=0)
+                            moe_gemm2_then_body(
+                                shared_b=True, shared_n_half=0, by_tile=by_tile
+                            )
                             rocdl.s_waitcnt(0)
                             barrier(vmcnt=0, lgkmcnt=0)
-                            moe_gemm2_then_body(shared_b=True, shared_n_half=1)
+                            moe_gemm2_then_body(
+                                shared_b=True, shared_n_half=1, by_tile=by_tile
+                            )
                         else:
-                            moe_gemm2_then_body(shared_b=True)
+                            moe_gemm2_then_body(shared_b=True, by_tile=by_tile)
                         scf.YieldOp([])
                     with ir.InsertionPoint(format_if.else_block):
-                        moe_gemm2_then_body(shared_b=False)
+                        moe_gemm2_then_body(shared_b=False, by_tile=by_tile)
                         scf.YieldOp([])
                 else:
-                    moe_gemm2_then_body()
+                    moe_gemm2_then_body(by_tile=by_tile)
+
+            def emit_moe_gemm2_body():
+                if const_expr(_persist_n > 1):
+                    # persist_n N-loop: this WG serially sweeps _persist_n consecutive
+                    # N-tiles for its M-block (launch N-grid was divided by _persist_n),
+                    # so the base tile is by*_persist_n. X for this M-block is identical
+                    # across the tiles, so re-streaming it keeps the activation
+                    # L2-resident (reused). A barrier separates iterations so tile j's
+                    # LDS is fully consumed before tile j+1 reuses the same static LDS.
+                    _pn_base = by * arith.constant(_persist_n, index=True)
+                    for _pn_j in range_constexpr(_persist_n):
+                        if _pn_j > 0:
+                            gpu.barrier()
+                        _emit_one_n_tile(
+                            by_tile=_pn_base + arith.constant(_pn_j, index=True)
+                        )
+                else:
+                    _emit_one_n_tile()
 
             if const_expr(persistent):
                 cur_active = arith.andi(still_active, blk_valid)
@@ -5441,6 +6800,14 @@ def compile_mixed_moe_gemm2_common(
                 gpu.barrier()
                 scf.YieldOp([expert_i32, expert_b_base])
             for_ip.__exit__(None, None, None)
+
+            # Close the StreamK loop nest (innermost first). Each level needs a
+            # barrier (LDS reuse between units) + YieldOp before __exit__.
+            if const_expr(_streamk_on):
+                for _sk_ip in reversed(_sk_ips):
+                    gpu.barrier()
+                    scf.YieldOp([])
+                    _sk_ip.__exit__(None, None, None)
 
     if heterogeneous_b:
 
@@ -5482,7 +6849,7 @@ def compile_mixed_moe_gemm2_common(
                 i32_size_expert_ids_in,
             )
 
-    else:
+    elif not (a2_compact or _streamk_on):
 
         @flyc.kernel(name=module_name)
         def moe_gemm2(
@@ -5520,6 +6887,49 @@ def compile_mixed_moe_gemm2_common(
                 i32_size_expert_ids_in,
             )
 
+    else:
+        # a2_compact OR streamk (non-het): trailing arg_blk_valid_start kernarg.
+        # a2_compact reads compacted-row bases; streamk flat/affine read wg_unit
+        # boundaries (other streamk modes ignore it but keep the ABI uniform).
+        # Distinct symbol (_a2c2 / _streamk tag) + extra kernarg -> byte-ident OFF.
+        @flyc.kernel(name=module_name)
+        def moe_gemm2(
+            arg_out: fx.Pointer,
+            arg_x: fx.Pointer,
+            arg_w: fx.Pointer,
+            arg_scale_x: fx.Pointer,
+            arg_scale_w: fx.Pointer,
+            arg_sorted_token_ids: fx.Pointer,
+            arg_expert_ids: fx.Pointer,
+            arg_sorted_weights: fx.Pointer,
+            arg_num_valid_ids: fx.Pointer,
+            arg_bias: fx.Pointer,
+            i32_tokens_in: fx.Int32,
+            i32_n_in: fx.Int32,
+            i32_k_in: fx.Int32,
+            i32_size_expert_ids_in: fx.Int32,
+            arg_blk_valid_start: fx.Pointer,
+        ):
+            _emit_moe_gemm2(
+                arg_out,
+                arg_x,
+                arg_w,
+                arg_scale_x,
+                arg_scale_w,
+                arg_w,
+                arg_scale_w,
+                arg_sorted_token_ids,
+                arg_expert_ids,
+                arg_sorted_weights,
+                arg_num_valid_ids,
+                arg_bias,
+                i32_tokens_in,
+                i32_n_in,
+                i32_k_in,
+                i32_size_expert_ids_in,
+                arg_blk_valid_start,
+            )
+
     cache_tag = (
         module_name,
         a_dtype,
@@ -5540,6 +6950,7 @@ def compile_mixed_moe_gemm2_common(
         waves_per_eu,
         use_async_copy,
         xcd_swizzle,
+        k_batch,
     )
     if heterogeneous_b:
         cache_tag += (shared_expert_id,)
@@ -5562,6 +6973,7 @@ def compile_mixed_moe_gemm2_common(
         i32_k_in: fx.Int32,
         i32_size_expert_ids_in: fx.Int32,
         stream: fx.Stream,
+        arg_blk_valid_start: fx.Pointer = None,
     ):
         _ = cache_tag
         allocator.finalized = False
@@ -5575,6 +6987,11 @@ def compile_mixed_moe_gemm2_common(
         gx = (
             n_in - model_dim_pad_idx + tile_n_idx - arith.constant(1, index=True)
         ) // tile_n_idx
+        if const_expr(_persist_n > 1):
+            # persist_n>1 folds _persist_n consecutive N-tiles into each WG, so the
+            # N-tile grid dim shrinks by that factor (_gx_total % _persist_n == 0 was
+            # asserted at resolution). _persist_n==1 keeps the original gx / IR.
+            gx = gx // arith.constant(_persist_n, index=True)
         if const_expr(persistent):
             gy = arith.constant(cu_num, index=True)
         else:
@@ -5604,6 +7021,24 @@ def compile_mixed_moe_gemm2_common(
                 i32_k_in,
                 i32_size_expert_ids_in,
             )
+        elif const_expr(a2_compact or _streamk_on):
+            launcher = moe_gemm2(
+                arg_out,
+                arg_x,
+                arg_w,
+                arg_scale_x,
+                arg_scale_w,
+                arg_sorted_token_ids,
+                arg_expert_ids,
+                arg_sorted_weights,
+                arg_num_valid_ids,
+                arg_bias,
+                i32_tokens_in,
+                i32_n_in,
+                i32_k_in,
+                i32_size_expert_ids_in,
+                arg_blk_valid_start,
+            )
         else:
             launcher = moe_gemm2(
                 arg_out,
@@ -5626,11 +7061,40 @@ def compile_mixed_moe_gemm2_common(
             for op in ctx.gpu_module_body.operations:
                 if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
                     op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(T.i32, wpe)
-        launcher.launch(
-            grid=(gx, gy, 1),
-            block=(256, 1, 1),
-            stream=stream,
-        )
+        if const_expr(_streamk_on):
+            # StreamK: fixed 1D persistent grid of streamk_num_wg WGs (each sweeps a
+            # load-balanced slice of the (m-block, n-tile) space in-kernel).
+            launcher.launch(
+                grid=(arith.constant(int(streamk_num_wg), index=True),
+                      arith.constant(1, index=True),
+                      arith.constant(1, index=True)),
+                block=(256, 1, 1), stream=stream,
+            )
+        elif const_expr(_remap_on):
+            # 3D (NUM_XCD, *, *) grid; persist_m==1 & persist_n==1 under remap, so
+            # gy == expert_blocks and gx == n_tiles. See stage2 resolution + decode.
+            _c_nxcd_l = arith.constant(_MOE_NUM_XCD, index=True)
+            _nxm1 = arith.constant(_MOE_NUM_XCD - 1, index=True)
+            if const_expr(_remap_gx):
+                _gz = (gx + _nxm1) // _c_nxcd_l
+                if const_expr(is_splitk):
+                    _gz = _gz * arith.constant(k_batch, index=True)
+                _grid = (_c_nxcd_l, gy, _gz)
+            else:
+                _gz = (gy + _nxm1) // _c_nxcd_l
+                if const_expr(_sk_axis_y):
+                    _grid = (_c_nxcd_l, gx * arith.constant(k_batch, index=True), _gz)
+                else:
+                    if const_expr(is_splitk):
+                        _gz = _gz * arith.constant(k_batch, index=True)
+                    _grid = (_c_nxcd_l, gx, _gz)
+            launcher.launch(grid=_grid, block=(256, 1, 1), stream=stream)
+        else:
+            launcher.launch(
+                grid=(gx, gy, k_batch),
+                block=(256, 1, 1),
+                stream=stream,
+            )
 
     if heterogeneous_b:
 
@@ -5674,7 +7138,7 @@ def compile_mixed_moe_gemm2_common(
                 stream,
             )
 
-    else:
+    elif not (a2_compact or _streamk_on):
 
         @flyc.jit
         def launch_mixed_moe_gemm2(
@@ -5712,6 +7176,50 @@ def compile_mixed_moe_gemm2_common(
                 i32_k_in,
                 i32_size_expert_ids_in,
                 stream,
+            )
+
+    else:
+        # a2_compact OR streamk (non-het): host passes arg_blk_valid_start before
+        # stream. streamk flat/affine read the wg_unit schedule from it; the other
+        # streamk modes ignore it but keep the ABI uniform.
+        @flyc.jit
+        def launch_mixed_moe_gemm2(
+            arg_out: fx.Pointer,
+            arg_x: fx.Pointer,
+            arg_w: fx.Pointer,
+            arg_scale_x: fx.Pointer,
+            arg_scale_w: fx.Pointer,
+            arg_sorted_token_ids: fx.Pointer,
+            arg_expert_ids: fx.Pointer,
+            arg_sorted_weights: fx.Pointer,
+            arg_num_valid_ids: fx.Pointer,
+            arg_bias: fx.Pointer,
+            i32_tokens_in: fx.Int32,
+            i32_n_in: fx.Int32,
+            i32_k_in: fx.Int32,
+            i32_size_expert_ids_in: fx.Int32,
+            arg_blk_valid_start: fx.Pointer,
+            stream: fx.Stream,
+        ):
+            _launch_mixed_moe_gemm2(
+                arg_out,
+                arg_x,
+                arg_w,
+                arg_scale_x,
+                arg_scale_w,
+                arg_w,
+                arg_scale_w,
+                arg_sorted_token_ids,
+                arg_expert_ids,
+                arg_sorted_weights,
+                arg_num_valid_ids,
+                arg_bias,
+                i32_tokens_in,
+                i32_n_in,
+                i32_k_in,
+                i32_size_expert_ids_in,
+                stream,
+                arg_blk_valid_start,
             )
 
     return launch_mixed_moe_gemm2

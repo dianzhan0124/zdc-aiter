@@ -52,7 +52,12 @@ def _warn_tile_override(axis: str, inter_dim: int, requested: int, resolved: int
 
 
 _SUFFIX_RE = re.compile(
-    r"(?:_kw(?P<kw>\d+))?(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$"
+    r"(?:_bp(?P<bp>\d+))?(?:_xp(?P<xp>\d+))?"
+    r"(?:_kw(?P<kw>\d+))?(?P<fp4>_fp4)?(?P<fp8>_fp8)?"
+    r"(?:_sbm(?P<sbm>\d+))?(?P<a2c>_a2c2?)?(?:_sk(?P<sk>\d+))?"
+    r"(?:_pn(?P<pn>\d+))?(?:_r(?P<remap>gy|gx))?(?P<ay>_ay)?"
+    r"(?P<fp8b>_fp8)?(?P<fp4b>_fp4)?"
+    r"(?:_streamk(?P<skwg>\d+)_(?P<skmode>lockstep_mouter|lockstep|xcd_nsplit|mfocus|flat|affine))?$"
 )
 
 
@@ -173,14 +178,32 @@ def get_flydsl_kernel_params(name: str) -> dict | None:
         params = _KERNEL_PARAMS.get(base_name)
         if params is not None:
             extra: dict = {}
+            if m.group("bp") is not None and int(m.group("bp")) >= 2:
+                extra["b_pool_depth"] = int(m.group("bp"))
+            if m.group("xp") is not None and int(m.group("xp")) >= 2:
+                extra["x_pool_depth"] = int(m.group("xp"))
             if m.group("kw") is not None:
                 extra["k_wave"] = int(m.group("kw"))
-            if m.group("fp4"):
+            if m.group("fp4") or m.group("fp4b"):
                 extra["out_dtype"] = "fp4"
-            if m.group("fp8"):
+            if m.group("fp8") or m.group("fp8b"):
                 extra["out_dtype"] = "fp8"
             if m.group("sbm") is not None:
                 extra["sort_block_m"] = int(m.group("sbm"))
+            if m.group("a2c") is not None:
+                extra["a2_compact"] = True
+            if m.group("sk") is not None:
+                extra["k_batch"] = int(m.group("sk"))
+            if m.group("pn") is not None:
+                extra["persist_n"] = int(m.group("pn"))
+            if m.group("remap") is not None:
+                extra["remap"] = m.group("remap")
+            if m.group("ay") is not None:
+                extra["splitk_axis"] = "y"
+            if m.group("skwg") is not None:
+                extra["streamk"] = True
+                extra["streamk_num_wg"] = int(m.group("skwg"))
+                extra["streamk_mode"] = m.group("skmode")
             return {**params, **extra}
     return None
 
@@ -281,7 +304,288 @@ def get_flydsl_stage1_kernels(
                                             "xcd_swizzle": xcd,
                                             "k_wave": kw,
                                         }
+                                        # XCD remap (Batch 4): 3D-grid dispatch
+                                        # reshuffle. Bit-identical to the 2D base.
+                                        # Only the plain path (xcd==0, persist_m==1
+                                        # -- stage1 default) is eligible; the compile
+                                        # mutex rejects xcd_swizzle/persist_m!=1.
+                                        # Default OFF; via AITER_TUNE_MOE_REMAP.
+                                        if xcd == 0:
+                                            for _rm in _remap_tune_variants():
+                                                kernels[name + f"_r{_rm}"] = {
+                                                    **kernels[name],
+                                                    "remap": _rm,
+                                                }
+                                        # StreamK (Batch 4): persistent-grid
+                                        # dispatch. Bit-identical to the plain
+                                        # base. Only the plain path (xcd==0,
+                                        # persist_m==1, k_batch==1) is eligible;
+                                        # the compile mutex rejects the rest.
+                                        # Default OFF; via AITER_TUNE_MOE_STREAMK.
+                                        if xcd == 0 and kb == 1 and kw == 1:
+                                            for _wg, _md in _streamk_tune_variants():
+                                                kernels[
+                                                    name + f"_streamk{_wg}_{_md}"
+                                                ] = {
+                                                    **kernels[name],
+                                                    "streamk": True,
+                                                    "streamk_num_wg": _wg,
+                                                    "streamk_mode": _md,
+                                                }
     return kernels
+
+
+def _pool_variants() -> list[tuple[str, dict]]:
+    """Yield (name_tag, params) for stage2 B/X prefetch-pool depths.
+
+    Default candidate set = no-pool ("") + the bp3/xp3 double pool (rujia's tuned
+    winner, ~-3..-5.5% at mid/large tokens). Override/extend via the env var
+    ``AITER_TUNE_MOE_POOL`` (comma-separated), e.g. ``0,bp3,xp3,bp3xp3,bp4xp4``.
+    Tokens: ``0`` (none), ``bp{N}``, ``xp{N}``, ``bp{N}xp{M}``. Tag order matches
+    the kernel-name convention (``_bp{N}`` before ``_xp{N}``) and the parse in
+    ``_SUFFIX_RE`` / the stage2 registry. Only depth>=2 is honored (the kernel's
+    ``_use_pool`` gate also requires depth>=2), so ``bp1``/``xp1`` collapse to "".
+    """
+    spec_env = os.environ.get("AITER_TUNE_MOE_POOL", "") or ""
+    specs = [s.strip() for s in spec_env.split(",") if s.strip()] or ["0", "bp3xp3"]
+    seen: set = set()
+    out: list[tuple[str, dict]] = []
+    for s in specs:
+        tag = ""
+        p: dict = {}
+        mb = re.search(r"bp(\d+)", s)
+        if mb and int(mb.group(1)) >= 2:
+            p["b_pool_depth"] = int(mb.group(1))
+            tag += f"_bp{mb.group(1)}"
+        mx = re.search(r"xp(\d+)", s)
+        if mx and int(mx.group(1)) >= 2:
+            p["x_pool_depth"] = int(mx.group(1))
+            tag += f"_xp{mx.group(1)}"
+        if tag in seen:
+            continue
+        seen.add(tag)
+        out.append((tag, p))
+    return out
+
+
+def _sk_tune_batches() -> list[int]:
+    """stage2 split-K (k_batch) candidates the autotuner should try.
+
+    Split-K partitions the down-GEMM K=inter_dim across ``k_batch`` workgroups
+    (block_id.z) and sums the K-partials via the existing atomic accumulate. It
+    only helps the concurrency-starved stage2 shapes (few m-blocks, large K); on
+    the common large-grid shapes it is neutral-to-slower, so it is DEFAULT OFF to
+    keep the tuned result byte-identical. Enable/extend via
+    ``AITER_TUNE_MOE_STAGE2_SPLITK`` (comma-separated), e.g. ``2,4``.
+
+    Emitted as the ``_sk{N}`` name suffix parsed by ``_SUFFIX_RE``. Per-shape
+    legality (inter_dim % k_batch == 0, K_per_batch a multiple of 256 and tile_k,
+    >= 2*tile_k) is checked by the tuner before dispatch; the compile also rejects
+    illegal combos.
+    """
+    spec = (os.environ.get("AITER_TUNE_MOE_STAGE2_SPLITK", "") or "").strip()
+    if not spec:
+        return []
+    out = []
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if tok.isdigit() and int(tok) > 1:
+            out.append(int(tok))
+    return out
+
+
+def _pn_tune_factors() -> list[int]:
+    """stage2 persist_n (N-merge) candidates the autotuner should try.
+
+    persist_n folds ``persist_n`` consecutive N-tiles (model_dim output tiles) into
+    each workgroup, which serially sweeps them. The N-tiles of an M-block share the
+    same stage2 activation X (X depends only on M/inter_dim, not the output dim), so
+    merging keeps X L2-resident and shrinks the launch N-grid. It only helps the
+    concurrency-rich stage2 shapes (large N-grid) and is neutral-to-slower when the
+    grid is already small, so it is DEFAULT OFF to keep the tuned result
+    byte-identical. Enable/extend via ``AITER_TUNE_MOE_STAGE2_PERSIST_N``
+    (comma-separated), e.g. ``2,4``.
+
+    Emitted as the ``_pn{N}`` name suffix parsed by ``_SUFFIX_RE``. Per-shape
+    legality (model_dim/tile_n divisible by persist_n, plain path k_batch==1 &
+    persist_m==1 & xcd==0 & no model_dim_pad) is enforced at compile (illegal combos
+    silently fall back to persist_n=1 -> byte-identical), and the tuner pre-filters
+    candidates that cannot divide the N-grid before dispatch.
+    """
+    spec = (os.environ.get("AITER_TUNE_MOE_STAGE2_PERSIST_N", "") or "").strip()
+    if not spec:
+        return []
+    out = []
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if tok.isdigit() and int(tok) > 1:
+            out.append(int(tok))
+    return out
+
+
+def _remap_tune_variants() -> list[str]:
+    """XCD-remap variants the autotuner should try, per stage.
+
+    remap re-derives the workgroup->tile mapping from a 3D (NUM_XCD, *, *) launch
+    grid to keep an XCD's data slice L2-resident: ``gy`` splits the sorted-M/expert
+    axis (keeps activation resident), ``gx`` splits the N axis (keeps weight resident).
+    It ONLY reshuffles which WG computes which tile -- the per-tile arithmetic and
+    output location are unchanged -- so a remap kernel is numerically bit-identical to
+    the ``off`` (2D) kernel; it is purely an L2-locality / dispatch-order tuning knob.
+
+    Emitted as the ``_rgy``/``_rgx`` name suffix parsed by ``_SUFFIX_RE`` (off = empty
+    tag = byte-identical base). DEFAULT OFF (only the 2D base is enumerated) to keep
+    the tuned result byte-identical. Enable via ``AITER_TUNE_MOE_REMAP`` (comma-
+    separated subset of ``gy,gx``), e.g. ``gy`` or ``gy,gx``. remap is mutually
+    exclusive with xcd_swizzle / persist_m>1 / persistent / persist_n>1 (the compile
+    rejects those combos), so it is only enumerated on the plain atomic base.
+    """
+    spec = (os.environ.get("AITER_TUNE_MOE_REMAP", "") or "").strip().lower()
+    if not spec:
+        return []
+    out = []
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if tok in ("gy", "gx") and tok not in out:
+            out.append(tok)
+    return out
+
+
+def _streamk_tune_variants() -> list[tuple[int, str]]:
+    """StreamK (persistent-grid) variants the autotuner should try, per stage.
+
+    StreamK launches a fixed grid of ``num_wg`` persistent workgroups that sweep
+    the output tiles cooperatively (companion ``streamk_schedule.py`` precomputes
+    even-split flat-unit boundaries). It ONLY reshuffles which WG computes which
+    tile and in what order -- the per-tile arithmetic and output location are
+    unchanged -- so a StreamK kernel is numerically bit-identical to the plain
+    (non-persistent) base; it is purely a dispatch / L2-locality tuning knob for
+    the concurrency-starved shapes (few tiles, many CUs idle otherwise).
+
+    Emitted as the ``_streamk{N}_{mode}`` name suffix parsed by ``_SUFFIX_RE``.
+    DEFAULT OFF (only the non-persistent base is enumerated) to keep the tuned
+    result byte-identical. Enable via ``AITER_TUNE_MOE_STREAMK`` = comma-separated
+    ``{num_wg}:{mode}`` specs (e.g. ``256:mfocus,304:lockstep``); ``num_wg`` must be
+    a multiple of NUM_XCD (default 8) and ``mode`` one of
+    lockstep/lockstep_mouter/xcd_nsplit/mfocus/flat/affine. StreamK is mutually
+    exclusive with split-K / persist_m>1 / persist_n>1 / remap / xcd_swizzle /
+    a2_compact / heterogeneous_b (the compile rejects those combos), so it is only
+    enumerated on the plain base.
+    """
+    spec = (os.environ.get("AITER_TUNE_MOE_STREAMK", "") or "").strip().lower()
+    if not spec:
+        return []
+    _modes = {
+        "lockstep",
+        "lockstep_mouter",
+        "xcd_nsplit",
+        "mfocus",
+        "flat",
+        "affine",
+    }
+    try:
+        num_xcd = int(os.environ.get("AITER_MOE_NUM_XCD", "8") or "8")
+    except ValueError:
+        num_xcd = 8
+    num_xcd = max(1, num_xcd)
+    out: list[tuple[int, str]] = []
+    seen: set = set()
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if not tok or ":" not in tok:
+            continue
+        wg_s, mode = tok.split(":", 1)
+        wg_s = wg_s.strip()
+        mode = mode.strip()
+        if not wg_s.isdigit():
+            continue
+        wg = int(wg_s)
+        if wg <= 0 or wg % num_xcd != 0 or mode not in _modes:
+            continue
+        key = (wg, mode)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _a2c_tune_enabled() -> bool:
+    """Whether the autotuner should try a2_compact (expert-major compacted a2).
+
+    Unlike the per-kernel pool/b_nt knobs, a2_compact is a COUPLED stage1<->stage2
+    property (stage1 writes compacted, stage2 reads compacted -- they must match),
+    so it is NOT enumerated as an independent per-stage name token. The tuner
+    re-profiles the best (stage1, stage2) PAIR with a2_compact and keeps it only
+    when correct AND faster than the token-major pair.
+
+    Default OFF -> tuned result byte-identical to before. Enable via
+    ``AITER_TUNE_MOE_A2C=1``.
+    """
+    v = (os.environ.get("AITER_TUNE_MOE_A2C", "") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def compute_blk_valid_start(
+    sorted_token_ids,
+    num_tokens: int,
+    block_m: int,
+    topk: int,
+    num_valid_ids=None,
+):
+    """Exclusive prefix-sum of per-sort-block valid-row counts, for the compacted
+    (expert-major, no-padding) a2 layout used by a2_compact.
+
+    A sorted position ``p = b*block_m + r`` is *valid* exactly as the stage
+    kernels decide it: fused ``t = id & 0xFFFFFF`` with ``t < num_tokens`` AND
+    slot ``s = id >> 24`` with ``s < topk``, AND (when given) ``p < num_valid_ids``
+    (the padded tail of the array is zero-filled, i.e. ``t == 0``, and must not
+    be counted). Valid rows are a contiguous prefix within each block, so the
+    compacted row of valid position ``p`` is ``blk_valid_start[b] + r`` and the
+    layout is gapless.
+
+    NOTE (v4_pro): ``block_m`` MUST equal the kernels' sort block size
+    (``sort_block_m``, == ``tile_m`` for the tuned path). stage2 may use a tile_m
+    that sub-divides the sort block; the kernel folds its fine tile index back to
+    the coarse sort block before indexing ``blk_valid_start`` (see
+    ``mixed_moe_gemm_2stage_common.py``).
+
+    Args:
+      sorted_token_ids: 1-D int32 tensor (fused token|slot).
+      num_tokens: real token count (token-id sentinel threshold).
+      block_m: sort block size (== stage sort_block_m).
+      topk: routing top-k (slot sentinel threshold).
+      num_valid_ids: optional int32 tensor/int bounding the processed region.
+    Returns:
+      (blk_valid_start[num_blocks] int32, total_valid int) on the same device.
+    """
+    n = sorted_token_ids.numel()
+    num_blocks = (n + block_m - 1) // block_m
+    fused = sorted_token_ids.reshape(-1).to(torch.int64)
+    tok = fused & 0xFFFFFF
+    slot = fused >> 24
+    valid = (tok < int(num_tokens)) & (slot < int(topk))
+    if num_valid_ids is not None:
+        if torch.is_tensor(num_valid_ids):
+            nvi = num_valid_ids.reshape(-1)[0].to(torch.int64)
+        else:
+            nvi = int(num_valid_ids)
+        pos = torch.arange(n, device=sorted_token_ids.device)
+        valid = valid & (pos < nvi)
+    valid = valid.to(torch.int32)
+    if valid.numel() < num_blocks * block_m:
+        pad = num_blocks * block_m - valid.numel()
+        valid = torch.cat(
+            [valid, torch.zeros(pad, dtype=torch.int32, device=valid.device)]
+        )
+    per_block = valid.view(num_blocks, block_m).sum(dim=1)  # [num_blocks] int32
+    start = torch.zeros(
+        num_blocks, dtype=torch.int32, device=sorted_token_ids.device
+    )
+    if num_blocks > 1:
+        start[1:] = torch.cumsum(per_block, dim=0)[:-1].to(torch.int32)
+    total_valid = int(per_block.sum().item())
+    return start, total_valid
 
 
 def get_flydsl_stage2_kernels(
@@ -334,6 +638,76 @@ def get_flydsl_stage2_kernels(
                                 **base_params,
                                 "persist": True,
                             }
+                            # B/X deep prefetch ring pool (Batch 2). Only the
+                            # small-N tiles (tile_n<=128) have the register room
+                            # for the extra in-flight B/X tiles; tile_n=256
+                            # doubles the down-GEMM accumulators and would spill.
+                            # Depth>=2 only (empty tag == no-pool, already
+                            # emitted). Default AITER_TUNE_MOE_POOL keeps just
+                            # bp3xp3; env can widen. Pool applies on top of the
+                            # non-persist base only (the coarse ping/pong path the
+                            # kernel-side pool front-loads into; persist/async use
+                            # their own prefetch and reject the pool at compile).
+                            if tn <= 128:
+                                for ptag, pp in _pool_variants():
+                                    if not pp:
+                                        continue
+                                    kernels[base_name + ptag] = {
+                                        **base_params,
+                                        **pp,
+                                    }
+                            # stage2 split-K (k_batch>1): partition K across z-grid
+                            # workgroups + atomic-sum. Only the atomic (non-reduce)
+                            # non-persist base is eligible (the compile mutex rejects
+                            # persist/persist_m>1/reduce). Default OFF; enabled via
+                            # AITER_TUNE_MOE_STAGE2_SPLITK. Per-shape K legality is
+                            # filtered by the tuner before dispatch.
+                            if mode == "atomic":
+                                for _kb in _sk_tune_batches():
+                                    kernels[base_name + f"_sk{_kb}"] = {
+                                        **base_params,
+                                        "k_batch": _kb,
+                                    }
+                            # stage2 persist_n (N-merge): fold N consecutive output
+                            # tiles into each WG to keep the shared activation X
+                            # L2-resident. Only the atomic non-persist non-xcd base is
+                            # enumerated (matches the numerically-verified path; the
+                            # compile mutex also rejects persist/persist_m>1/xcd/split-K
+                            # -> silent fallback to persist_n=1). Default OFF; enabled
+                            # via AITER_TUNE_MOE_STAGE2_PERSIST_N. Per-shape N-grid
+                            # legality is filtered by the tuner before dispatch.
+                            if mode == "atomic" and xcd == 0:
+                                for _pn in _pn_tune_factors():
+                                    kernels[base_name + f"_pn{_pn}"] = {
+                                        **base_params,
+                                        "persist_n": _pn,
+                                    }
+                            # XCD remap (Batch 4): 3D-grid workgroup->tile reshuffle
+                            # for L2 locality. Bit-identical to the 2D base (only the
+                            # dispatch order changes). Only the atomic non-xcd base is
+                            # eligible (the compile mutex rejects xcd_swizzle/persist/
+                            # persist_m>1/persist_n>1). Default OFF; enabled via
+                            # AITER_TUNE_MOE_REMAP.
+                            if mode == "atomic" and xcd == 0:
+                                for _rm in _remap_tune_variants():
+                                    kernels[base_name + f"_r{_rm}"] = {
+                                        **base_params,
+                                        "remap": _rm,
+                                    }
+                            # StreamK (Batch 4): persistent-grid cooperative tile
+                            # sweep. Bit-identical to the plain base (only dispatch
+                            # order/WG assignment changes). Only the atomic non-xcd
+                            # base is eligible (the compile mutex rejects xcd_swizzle
+                            # /persist/persist_m>1/persist_n>1/split-K/a2_compact).
+                            # Default OFF; enabled via AITER_TUNE_MOE_STREAMK.
+                            if mode == "atomic" and xcd == 0:
+                                for _wg, _md in _streamk_tune_variants():
+                                    kernels[base_name + f"_streamk{_wg}_{_md}"] = {
+                                        **base_params,
+                                        "streamk": True,
+                                        "streamk_num_wg": _wg,
+                                        "streamk_mode": _md,
+                                    }
     _register_production_variants_stage2(kernels, a_dtype, b_dtype, out_dtype)
     return kernels
 
@@ -630,6 +1004,12 @@ def compile_flydsl_moe_stage1(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    a2_compact: bool = False,
+    remap: str | None = None,
+    splitk_axis: str | None = None,
+    streamk: bool = False,
+    streamk_num_wg: int = 0,
+    streamk_mode: str = "mfocus",
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W): build the ported gemm1
@@ -690,6 +1070,12 @@ def compile_flydsl_moe_stage1(
             xcd_swizzle=xcd_swizzle,
             k_wave=k_wave,
             v2_output_layout=v2_output_layout,
+            a2_compact=a2_compact,
+            remap=remap,
+            splitk_axis=splitk_axis,
+            streamk=streamk,
+            streamk_num_wg=streamk_num_wg,
+            streamk_mode=streamk_mode,
         )
     else:
         raise ValueError(
@@ -720,6 +1106,16 @@ def compile_flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    b_pool_depth: int = 0,
+    x_pool_depth: int = 0,
+    a2_compact: bool = False,
+    k_batch: int = 1,
+    persist_n: int = 1,
+    remap: str | None = None,
+    splitk_axis: str | None = None,
+    streamk: bool = False,
+    streamk_num_wg: int = 0,
+    streamk_mode: str = "mfocus",
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W) down-proj: build the ported gemm2
@@ -765,16 +1161,29 @@ def compile_flydsl_moe_stage2(
             waves_per_eu=waves_per_eu,
             use_async_copy=use_async_copy,
             cu_num_mul=cu_num_mul,
-            # API parity (reviewer #3): forward `b_nt` and `xcd_swizzle`
-            # from the kernel-name parser. They are accepted as ignored
-            # kwargs on the fp4xfp4 path so callers parsing the
-            # `_bnt{N}` / `_xcd{N}` registry suffixes don't need
-            # per-dtype special cases.
+            # Forward `b_nt` and `xcd_swizzle` from the kernel-name parser
+            # (`_bnt{N}` / `_xcd{N}` registry suffixes). `b_nt` is now live on
+            # the fp4xfp4 stage2 path: it drives the down-weight load
+            # cache_modifier (0 = L2-cached, 2 = non-temporal/bypass-L2),
+            # matching stage1's b_nt semantics.
             b_nt=b_nt,
             xcd_swizzle=xcd_swizzle,
             model_dim_pad=model_dim_pad,
             inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
+            # Batch 2 B/X deep prefetch ring pool (stage2 only; the fp4/fp8
+            # coarse ping/pong path front-loads depth-D tiles). Default 0 => no
+            # pool (byte-identical to pre-Batch-2). See compile_mixed_moe_gemm2.
+            b_pool_depth=b_pool_depth,
+            x_pool_depth=x_pool_depth,
+            a2_compact=a2_compact,
+            k_batch=k_batch,
+            persist_n=persist_n,
+            remap=remap,
+            splitk_axis=splitk_axis,
+            streamk=streamk,
+            streamk_num_wg=streamk_num_wg,
+            streamk_mode=streamk_mode,
         )
     else:
         raise ValueError(
@@ -832,6 +1241,7 @@ def _s1_args_fp4(
     situ_beta=1.0,
     situ_linear_beta=1.0,
     pass_swiglu_limit: bool = True,
+    blk_valid_start=None,
 ):
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
     _bias = bias if bias is not None else empty_f32
@@ -854,6 +1264,11 @@ def _s1_args_fp4(
         k_in,
         size_expert_ids_in,
     )
+    # a2_compact: trailing arg_blk_valid_start kernarg, placed AFTER swiglu_limit
+    # and BEFORE stream (matches the a2c launch_mixed_moe_gemm1 host ABI).
+    _bvs_tail = (
+        (ptr_arg(blk_valid_start),) if blk_valid_start is not None else ()
+    )
     if pass_swiglu_limit:
         beta = float(situ_beta)
         linear_beta = float(situ_linear_beta)
@@ -863,9 +1278,8 @@ def _s1_args_fp4(
             linear_beta,
             1.0 / linear_beta,
             float(swiglu_limit),
-            stream,
-        )
-    return args + (stream,)
+        ) + _bvs_tail + (stream,)
+    return args + _bvs_tail + (stream,)
 
 
 def _s1_args_std(
@@ -921,6 +1335,7 @@ def _s2_args_fp4(
     dev,
     bias=None,
     stream=None,
+    blk_valid_start=None,
 ):
     _bias = (
         bias.view(-1)
@@ -929,6 +1344,11 @@ def _s2_args_fp4(
     )
     if stream is None:
         stream = torch.cuda.current_stream()
+    # a2_compact: trailing arg_blk_valid_start kernarg BEFORE stream (matches the
+    # a2c launch_mixed_moe_gemm2 host ABI).
+    _bvs_tail = (
+        (ptr_arg(blk_valid_start),) if blk_valid_start is not None else ()
+    )
     return (
         ptr_arg(target),
         ptr_arg(a),
@@ -944,8 +1364,7 @@ def _s2_args_fp4(
         n_in,
         k_in,
         blocks,
-        stream,
-    )
+    ) + _bvs_tail + (stream,)
 
 
 def _s2_args_std(
@@ -1457,6 +1876,12 @@ def _flydsl_moe_stage1_impl(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    a2_compact: bool = False,
+    remap: str | None = None,
+    splitk_axis: str | None = None,
+    streamk: bool = False,
+    streamk_num_wg: int = 0,
+    streamk_mode: str = "mfocus",
     _compile_kernel=compile_flydsl_moe_stage1,
     _build_mx_args=_s1_args_fp4,
 ):
@@ -1665,7 +2090,73 @@ def _flydsl_moe_stage1_impl(
             f"{_situ_beta_val!r}/{_situ_linear_beta_val!r}"
         )
 
+    # a2_compact stage1 writes the intermediate in compacted expert-major order;
+    # the kernel needs blk_valid_start (per-tile_m-block exclusive prefix-sum of
+    # valid rows) as a trailing kernarg. Requires the sorted/quant path (checked
+    # in the kernel too). Only the MX (fp4/fp8) path is wired.
+    _blk_valid_start = None
+    if a2_compact and use_mx_gemm and _need_sort:
+        _blk_valid_start, _ = compute_blk_valid_start(
+            sorted_token_ids.view(-1),
+            token_num,
+            tile_m,
+            topk,
+            num_valid_ids=num_valid_ids,
+        )
+
+    # StreamK stage1: persistent-grid dispatch. The kernel always takes the trailing
+    # arg_blk_valid_start kernarg (reusing a2_compact's slot -- mutex-checked in the
+    # compile fn). flat/affine modes read the even-split wg_unit_start schedule
+    # (n_tiles = inter_dim//tile_n, k_tiles=1); the other four modes decode in-kernel
+    # and ignore the buffer, but still need a non-null pointer for the uniform ABI.
+    _sk_num_wg = 0
+    _sk_blk_valid_start = None
+    if streamk and use_mx_gemm:
+        from .kernels.streamk_schedule import (
+            streamk_default_num_wg,
+            flydsl_streamk_schedule,
+        )
+        _sk_num_wg = (
+            int(streamk_num_wg)
+            if streamk_num_wg and int(streamk_num_wg) > 0
+            else streamk_default_num_wg()
+        )
+        _sk_mode = str(streamk_mode).lower()
+        if _sk_mode in ("flat", "affine"):
+            # Mirror the kernel's compile-time _sk_ntiles == launcher gx (uses the
+            # runtime n dim == 2*inter_dim for mx gemm, gate+up packed).
+            _gm = str(gate_mode).lower()
+            _gu_il = _gm in ("interleave", "mock_gate_only")
+            _gate_only = _gm == "gate_only"
+            _t2pad = 0
+            if not _gate_only:
+                _tk2 = int(tile_k) // 2
+                _t2pad = (_tk2 - (int(inter_dim) - int(inter_dim_pad)) % _tk2) % _tk2
+            _ibase = 2 * int(inter_dim) - 2 * int(inter_dim_pad) + _t2pad
+            if _gu_il:
+                _sk_s1_ntiles = (_ibase + int(tile_n) - 1) // int(tile_n)
+            else:
+                _sk_s1_ntiles = ((_ibase + 2 * int(tile_n) - 1) // int(tile_n)) // 2
+            _sk_blk_valid_start = flydsl_streamk_schedule(
+                num_valid_ids, _sk_num_wg, tile_m, _sk_s1_ntiles, 1
+            )
+        else:
+            # non-null placeholder so the trailing kernarg is always bound.
+            _sk_blk_valid_start = torch.zeros(
+                _sk_num_wg + 1, dtype=torch.int32, device=dev
+            )
+
     if use_mx_gemm:
+        # Only forward blk_valid_start when a2_compact OR streamk is active -- the
+        # injected FHMoE builder does not accept it (both reject het anyway).
+        _mx_bvs = (
+            _sk_blk_valid_start if _sk_blk_valid_start is not None else _blk_valid_start
+        )
+        _mx_extra = (
+            {"blk_valid_start": _mx_bvs}
+            if _mx_bvs is not None
+            else {}
+        )
         args = _build_mx_args(
             _kernel_out.view(-1),
             a.view(-1),
@@ -1690,6 +2181,7 @@ def _flydsl_moe_stage1_impl(
             swiglu_limit=_swiglu_limit_val,
             situ_beta=_situ_beta_val,
             situ_linear_beta=_situ_linear_beta_val,
+            **_mx_extra,
         )
     else:
         args = _s1_args_std(
@@ -1737,6 +2229,19 @@ def _flydsl_moe_stage1_impl(
     # The injected FHMoE compiler does not implement the v2 sorted-row layout.
     if _v2_output_layout:
         compile_kwargs["v2_output_layout"] = True
+    # a2_compact only forwarded when active (injected FHMoE builder lacks the kwarg).
+    if _blk_valid_start is not None:
+        compile_kwargs["a2_compact"] = True
+    # remap/splitk_axis only forwarded when non-default (FHMoE builder lacks them).
+    if remap not in (None, "off"):
+        compile_kwargs["remap"] = remap
+    if splitk_axis not in (None, "z"):
+        compile_kwargs["splitk_axis"] = splitk_axis
+    # streamk only forwarded when active (FHMoE builder lacks the kwargs).
+    if streamk and use_mx_gemm:
+        compile_kwargs["streamk"] = True
+        compile_kwargs["streamk_num_wg"] = _sk_num_wg
+        compile_kwargs["streamk_mode"] = _sk_mode
     exe = _compile_kernel(**compile_kwargs)
     _run_compiled(exe, args)
 
@@ -1918,6 +2423,12 @@ def flydsl_moe_stage1(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    a2_compact: bool = False,
+    remap: str | None = None,
+    splitk_axis: str | None = None,
+    streamk: bool = False,
+    streamk_num_wg: int = 0,
+    streamk_mode: str = "mfocus",
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -1975,6 +2486,12 @@ def flydsl_moe_stage1(
         swiglu_limit=swiglu_limit,
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
+        a2_compact=a2_compact,
+        remap=remap,
+        splitk_axis=splitk_axis,
+        streamk=streamk,
+        streamk_num_wg=streamk_num_wg,
+        streamk_mode=streamk_mode,
     )
 
 
@@ -2010,6 +2527,16 @@ def _flydsl_moe_stage2_impl(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    b_pool_depth: int = 0,
+    x_pool_depth: int = 0,
+    a2_compact: bool = False,
+    k_batch: int = 1,
+    persist_n: int = 1,
+    remap: str | None = None,
+    splitk_axis: str | None = None,
+    streamk: bool = False,
+    streamk_num_wg: int = 0,
+    streamk_mode: str = "mfocus",
     _compile_kernel=compile_flydsl_moe_stage2,
     _build_mx_args=_s2_args_fp4,
 ) -> torch.Tensor:
@@ -2151,6 +2678,17 @@ def _flydsl_moe_stage2_impl(
         # FP8 uses non-persistent scheduling, so cap grid.y via persist_m.
         _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
 
+    # Split-K (k_batch>1) is mutually exclusive with the persistent/persist_m>1
+    # grid (the compile-time mutex rejects it). Force persist_m=1 so the plain
+    # (gx, gy, k_batch) grid is used.
+    if int(k_batch) > 1:
+        _persist_m = 1
+    # streamk uses a fixed 1D persistent grid decoded in-kernel; force persist_m=1
+    # so the (gx, gy, k_batch) grid path is bypassed and the compile-time mutex
+    # (streamk ⊥ persist_m!=1) is satisfied.
+    if streamk and b_dtype in ("fp4", "fp8"):
+        _persist_m = 1
+
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
     # fp4 and fp8 weights both use the MX gemm kernel (bias arg builder).
@@ -2191,7 +2729,62 @@ def _flydsl_moe_stage2_impl(
                 dtype=torch.uint8 if _s2_fp8_inter else out.dtype,
             )
 
+    # a2_compact stage2 reads the intermediate in compacted expert-major order.
+    # The kernel indexes blk_valid_start by the FINE tile (bx, per tile_m rows),
+    # so compute the prefix-sum with block_m=tile_m regardless of sort_block_m.
+    _blk_valid_start2 = None
+    if a2_compact and use_mx_gemm:
+        _blk_valid_start2, _ = compute_blk_valid_start(
+            sorted_token_ids.view(-1),
+            token_num,
+            tile_m,
+            topk,
+            num_valid_ids=num_valid_ids,
+        )
+
+    # streamk stage2: build the trailing blk_valid_start kernarg. flat/affine read
+    # the even-split wg-unit schedule from it; the other 4 modes decode in-kernel
+    # but still need a non-null pointer for the uniform ABI. n_tiles here mirrors
+    # the stage2 launcher gx == ceil((model_dim - model_dim_pad)/tile_n) (down-GEMM
+    # output dim; NOT 2*inter). streamk ⊥ a2_compact so it never coexists with the
+    # compacted schedule.
+    _sk2_num_wg = 0
+    _sk2_blk_valid_start = None
+    _sk2_mode = "mfocus"
+    if streamk and use_mx_gemm:
+        from .kernels.streamk_schedule import (
+            streamk_default_num_wg,
+            flydsl_streamk_schedule,
+        )
+        _sk2_num_wg = (
+            int(streamk_num_wg)
+            if streamk_num_wg and int(streamk_num_wg) > 0
+            else streamk_default_num_wg()
+        )
+        _sk2_mode = str(streamk_mode).lower()
+        if _sk2_mode in ("flat", "affine"):
+            _sk_s2_ntiles = (
+                int(model_dim) - int(model_dim_pad) + int(tile_n) - 1
+            ) // int(tile_n)
+            _sk2_blk_valid_start = flydsl_streamk_schedule(
+                num_valid_ids, _sk2_num_wg, tile_m, _sk_s2_ntiles, 1
+            )
+        else:
+            _sk2_blk_valid_start = torch.zeros(
+                _sk2_num_wg + 1, dtype=torch.int32, device=dev
+            )
+
     if use_mx_gemm:
+        _mx_bvs2 = (
+            _sk2_blk_valid_start
+            if _sk2_blk_valid_start is not None
+            else _blk_valid_start2
+        )
+        _mx_extra2 = (
+            {"blk_valid_start": _mx_bvs2}
+            if _mx_bvs2 is not None
+            else {}
+        )
         args = _build_mx_args(
             target,
             inter_states,
@@ -2208,6 +2801,7 @@ def _flydsl_moe_stage2_impl(
             m_blocks,
             dev,
             bias=bias,
+            **_mx_extra2,
         )
     else:
         args = _s2_args_std(
@@ -2249,6 +2843,16 @@ def _flydsl_moe_stage2_impl(
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
+        b_pool_depth=b_pool_depth,
+        x_pool_depth=x_pool_depth,
+        a2_compact=(_blk_valid_start2 is not None),
+        k_batch=k_batch,
+        persist_n=persist_n,
+        remap=remap,
+        splitk_axis=splitk_axis,
+        streamk=bool(streamk and use_mx_gemm),
+        streamk_num_wg=_sk2_num_wg,
+        streamk_mode=_sk2_mode,
     )
     _run_compiled(exe, args)
 
@@ -2306,6 +2910,16 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    b_pool_depth: int = 0,
+    x_pool_depth: int = 0,
+    a2_compact: bool = False,
+    k_batch: int = 1,
+    persist_n: int = 1,
+    remap: str | None = None,
+    splitk_axis: str | None = None,
+    streamk: bool = False,
+    streamk_num_wg: int = 0,
+    streamk_mode: str = "mfocus",
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -2359,6 +2973,16 @@ def flydsl_moe_stage2(
         return_per_slot=return_per_slot,
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        b_pool_depth=b_pool_depth,
+        x_pool_depth=x_pool_depth,
+        a2_compact=a2_compact,
+        k_batch=k_batch,
+        persist_n=persist_n,
+        remap=remap,
+        splitk_axis=splitk_axis,
+        streamk=streamk,
+        streamk_num_wg=streamk_num_wg,
+        streamk_mode=streamk_mode,
     )
 
 
