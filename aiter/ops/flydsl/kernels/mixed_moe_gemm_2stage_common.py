@@ -3419,6 +3419,10 @@ def compile_mixed_moe_gemm1_common(
                 stream,
             )
 
+    try:
+        launch_mixed_moe_gemm1._aot_module_name = module_name
+    except Exception:
+        pass
     return launch_mixed_moe_gemm1
 
 
@@ -5714,4 +5718,8 @@ def compile_mixed_moe_gemm2_common(
                 stream,
             )
 
+    try:
+        launch_mixed_moe_gemm2._aot_module_name = module_name
+    except Exception:
+        pass
     return launch_mixed_moe_gemm2

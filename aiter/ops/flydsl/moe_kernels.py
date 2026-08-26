@@ -1014,6 +1014,65 @@ _S2_LEGACY_FP8_SCALE_BLK = 8
 _S2_LEGACY_FP8_PITCH_ALIGN = 0
 
 
+_AOT_DROP = None
+_AOT_DROP_INIT = False
+_AOT_WARNED = set()
+
+
+def _get_aot_drop():
+    """Return a process-wide AotDrop if AITER_FLYDSL_AOT_DROP points at a drop, else None.
+
+    Loaded once. A drop that fails to load is treated as no-drop so a bad env var can never
+    break JIT serving, unless run-only mode is set, where a broken drop must surface.
+    """
+    global _AOT_DROP, _AOT_DROP_INIT
+    if _AOT_DROP_INIT:
+        return _AOT_DROP
+    _AOT_DROP_INIT = True
+    d = os.environ.get("AITER_FLYDSL_AOT_DROP")
+    if not d:
+        _AOT_DROP = None
+        return None
+    try:
+        from aiter.ops.flydsl.aot.flydsl_aot_runtime import AotDrop
+        _AOT_DROP = AotDrop(d)
+    except Exception as exc:
+        if os.environ.get("AITER_FLYDSL_AOT_RUN_ONLY") == "1":
+            raise RuntimeError(f"AOT run-only mode but drop failed to load: {d}: {exc}")
+        _AOT_DROP = None
+    return _AOT_DROP
+
+
+def _maybe_run_aot(exe, args):
+    """Try to launch via a pre-built AOT code object. Return True if handled.
+
+    Resolution key is the on-disk symbol name, stamped onto the launcher at compile time as
+    _aot_module_name (single source of truth: same string passed to flyc.kernel name=). On a
+    miss: run-only (AITER_FLYDSL_AOT_RUN_ONLY=1) raises; otherwise warn once and return False
+    so the caller JIT-compiles.
+    """
+    drop = _get_aot_drop()
+    if drop is None:
+        return False
+    run_only = os.environ.get("AITER_FLYDSL_AOT_RUN_ONLY") == "1"
+    name = getattr(exe, "_aot_module_name", None)
+    if name is None:
+        if run_only:
+            raise RuntimeError("AOT run-only mode but launcher has no _aot_module_name")
+        return False
+    try:
+        k = drop.get(name)
+    except Exception as exc:
+        if run_only:
+            raise RuntimeError(f"AOT run-only mode but artifact missing/ambiguous: {name}: {exc}")
+        if name not in _AOT_WARNED:
+            _AOT_WARNED.add(name)
+            print(f"[aiter][aot] miss {name}, fallback JIT: {exc}")
+        return False
+    k(*args)
+    return True
+
+
 def _run_moe_reduction(
     target,
     out,
@@ -1738,7 +1797,8 @@ def _flydsl_moe_stage1_impl(
     if _v2_output_layout:
         compile_kwargs["v2_output_layout"] = True
     exe = _compile_kernel(**compile_kwargs)
-    _run_compiled(exe, args)
+    if not _maybe_run_aot(exe, args):
+        _run_compiled(exe, args)
 
     num_sorted_rows = sorted_token_ids.shape[0]
     use_splitk_bias = _is_splitk and bias is not None
@@ -2250,7 +2310,8 @@ def _flydsl_moe_stage2_impl(
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
     )
-    _run_compiled(exe, args)
+    if not _maybe_run_aot(exe, args):
+        _run_compiled(exe, args)
 
     if not accumulate:
         use_mask = expert_mask is not None
